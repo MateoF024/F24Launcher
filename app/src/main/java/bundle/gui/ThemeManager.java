@@ -1,23 +1,22 @@
 package bundle.gui;
 
 import bundle.settings.AppSettings;
-
 import java.awt.*;
 
 public class ThemeManager {
-    private static AppSettings appSettings = AppSettings.getInstance();
+
+    // #13 — Fuentes cacheadas como constantes
+    private static final Font FONT_NORMAL = new Font("Segoe UI", Font.PLAIN, 13);
+    private static final Font FONT_BOLD   = new Font("Segoe UI", Font.BOLD, 13);
+    private static final Font FONT_SMALL  = new Font("Segoe UI", Font.PLAIN, 11);
+    private static final Font FONT_LARGE  = new Font("Segoe UI", Font.BOLD, 15);
+
+    // #14 — Estado de tema cacheado, evita llamar AppSettings en cada repaint
+    private static boolean darkMode = AppSettings.getInstance().isDarkMode();
 
     public static class Colors {
-        public final Color background;
-        public final Color titleBar;
-        public final Color text;
-        public final Color primary;
-        public final Color fieldBackground;
-        public final Color success;
-        public final Color progressBackground;
-        public final Color border;
-        public final Color buttonHover;
-        public final Color panelBackground;
+        public final Color background, titleBar, text, primary, fieldBackground;
+        public final Color success, progressBackground, border, buttonHover, panelBackground;
 
         private Colors(Color bg, Color title, Color text, Color primary, Color fieldBg,
                        Color success, Color progBg, Color border, Color hover, Color panelBg) {
@@ -35,56 +34,47 @@ public class ThemeManager {
     }
 
     public static final Colors DARK = new Colors(
-            new Color(18, 18, 18),    // Background - muy oscuro
-            new Color(28, 28, 28),    // TitleBar - gris oscuro diferenciado
-            new Color(240, 240, 240), // Text - casi blanco
-            new Color(30, 136, 229),  // Primary - azul
-            new Color(42, 42, 42),    // FieldBackground - gris medio oscuro
-            new Color(76, 175, 80),   // Success - verde
-            new Color(35, 35, 35),    // ProgressBackground - gris oscuro
-            new Color(65, 65, 65),    // Border - gris medio
-            new Color(50, 146, 239),  // ButtonHover - azul más claro
-            new Color(22, 22, 22)     // PanelBackground - gris muy oscuro
+            new Color(18, 18, 18),
+            new Color(28, 28, 28),
+            new Color(240, 240, 240),
+            new Color(30, 136, 229),
+            new Color(42, 42, 42),
+            new Color(76, 175, 80),
+            new Color(35, 35, 35),
+            new Color(65, 65, 65),
+            new Color(50, 146, 239),
+            new Color(22, 22, 22)
     );
 
     public static final Colors LIGHT = new Colors(
-            new Color(252, 252, 252), // Background - casi blanco
-            new Color(225, 225, 225), // TitleBar - gris claro diferenciado
-            new Color(25, 25, 25),    // Text - casi negro
-            new Color(13, 110, 253),  // Primary - azul
-            new Color(255, 255, 255), // FieldBackground - blanco puro
-            new Color(25, 135, 84),   // Success - verde
-            new Color(200, 200, 200), // ProgressBackground - gris medio
-            new Color(160, 160, 160), // Border - gris medio oscuro
-            new Color(0, 86, 179),    // ButtonHover - azul oscuro
-            new Color(240, 240, 240)  // PanelBackground - gris claro
+            new Color(252, 252, 252),
+            new Color(225, 225, 225),
+            new Color(25, 25, 25),
+            new Color(13, 110, 253),
+            new Color(255, 255, 255),
+            new Color(25, 135, 84),
+            new Color(200, 200, 200),
+            new Color(160, 160, 160),
+            new Color(0, 86, 179),
+            new Color(240, 240, 240)
     );
 
     public static boolean isDarkMode() {
-        return appSettings.isDarkMode();
+        return darkMode;
     }
 
     public static Colors getCurrentColors() {
-        return isDarkMode() ? DARK : LIGHT;
+        return darkMode ? DARK : LIGHT;
     }
 
+    // #14 — Al cambiar tema, actualizar caché local y persistir
     public static void toggleTheme() {
-        appSettings.setDarkMode(!appSettings.isDarkMode());
+        darkMode = !darkMode;
+        AppSettings.getInstance().setDarkMode(darkMode);
     }
 
-    public static Font getNormalFont() {
-        return new Font("Segoe UI", Font.PLAIN, 13);
-    }
-
-    public static Font getBoldFont() {
-        return new Font("Segoe UI", Font.BOLD, 13);
-    }
-
-    public static Font getSmallFont() {
-        return new Font("Segoe UI", Font.PLAIN, 11);
-    }
-
-    public static Font getLargeFont() {
-        return new Font("Segoe UI", Font.BOLD, 15);
-    }
+    public static Font getNormalFont() { return FONT_NORMAL; }
+    public static Font getBoldFont()   { return FONT_BOLD;   }
+    public static Font getSmallFont()  { return FONT_SMALL;  }
+    public static Font getLargeFont()  { return FONT_LARGE;  }
 }

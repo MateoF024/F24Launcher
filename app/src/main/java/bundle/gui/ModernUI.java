@@ -1,5 +1,6 @@
 package bundle.gui;
 
+import bundle.config.InstallerConfig;
 import bundle.installer.BundleInstaller;
 import bundle.settings.AppSettings;
 
@@ -194,16 +195,26 @@ public class ModernUI extends JFrame {
     }
 
     private void updateComponentsRecursively(Container container, ThemeManager.Colors colors) {
-        container.setBackground(colors.background);
-
         for (Component comp : container.getComponents()) {
-            if (comp instanceof JPanel) {
-                JPanel panel = (JPanel) comp;
+            // Saltar paneles que gestionan su propio tema
+            if (comp instanceof ModpacksPanel ||
+                    comp instanceof LoadersPanel  ||
+                    comp instanceof SettingsPanel ||
+                    comp instanceof NavigationPanel) {
+                continue;
+            }
+            if (comp instanceof JPanel panel) {
                 panel.setBackground(colors.background);
                 updateComponentsRecursively(panel, colors);
-            } else if (comp instanceof Container) {
-                updateComponentsRecursively((Container) comp, colors);
+            } else if (comp instanceof Container c) {
+                updateComponentsRecursively(c, colors);
             }
+        }
+    }
+
+    public void onConfigLoaded(InstallerConfig config) {
+        if (modpacksPanel != null) {
+            modpacksPanel.applyConfig(config);
         }
     }
 

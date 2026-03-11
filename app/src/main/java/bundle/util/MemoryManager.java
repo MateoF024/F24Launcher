@@ -65,15 +65,6 @@ public class MemoryManager {
         return fileSize > (info.freeMemory / 3) || fileSize > 100 * 1024 * 1024;
     }
 
-    public static void forceGarbageCollection() {
-        System.gc();
-        try {
-            Thread.sleep(25);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
     public static boolean isMemoryPressure() {
         return getCurrentMemoryInfo().usageRatio > MEMORY_USAGE_THRESHOLD;
     }

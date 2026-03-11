@@ -1,36 +1,31 @@
 package bundle.config;
 
-import java.util.List;
-import java.util.Map;
-import java.util.LinkedHashMap;
-import java.util.ArrayList;
+import java.util.*;
 
 public final class InstallerConfig {
     public final Map<String, DownloadConfig> configs;
     public final List<String> configNames;
 
-    private InstallerConfig(Map<String, DownloadConfig> configs, List<String> configNames) {
-        this.configs = Map.copyOf(configs);
-        this.configNames = List.copyOf(configNames);
+    private InstallerConfig(LinkedHashMap<String, DownloadConfig> source) {
+        this.configs = Collections.unmodifiableMap(source);
+        this.configNames = List.copyOf(source.keySet());
     }
 
     @Override
     public String toString() {
-        return String.format("%s { configs: %s }", this.getClass().getName(), configs);
+        return String.format("%s { configs: %s }", getClass().getName(), configs);
     }
 
     public static class Builder {
-        private final Map<String, DownloadConfig> configs = new LinkedHashMap<>();
-        private final List<String> configNames = new ArrayList<>();
+        private final LinkedHashMap<String, DownloadConfig> configs = new LinkedHashMap<>();
 
         public Builder with(String id, DownloadConfig download) {
             configs.put(id, download);
-            configNames.add(id);
             return this;
         }
 
         public InstallerConfig build() {
-            return new InstallerConfig(configs, configNames);
+            return new InstallerConfig(configs);
         }
     }
 }

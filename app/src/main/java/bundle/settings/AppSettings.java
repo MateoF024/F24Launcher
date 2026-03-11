@@ -20,7 +20,7 @@ public class AppSettings {
     @Expose private String lastGameDir = "";
     @Expose private boolean autoCleanup = true;
     @Expose private boolean showBetaVersions = false;
-    @Expose private Map<String, Boolean> folderSelections = new HashMap<>();
+    @Expose private Map<String, Boolean> folderSelections = new LinkedHashMap<>();
     @Expose private String selectedLoaderType = "Fabric";
     @Expose private boolean preserveUserSettings = true;
 
@@ -110,7 +110,7 @@ public class AppSettings {
 
     private void validateSettings() {
         if (folderSelections == null) {
-            folderSelections = new HashMap<>();
+            folderSelections = new LinkedHashMap<>();
         }
 
         for (FolderType folder : FolderType.values()) {

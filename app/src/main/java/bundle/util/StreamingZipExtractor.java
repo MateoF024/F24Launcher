@@ -26,9 +26,6 @@ public class StreamingZipExtractor {
             extractUsingZipFile(zipFilePath, targetDir, foldersToClean, tracker, memInfo.optimalBufferSize);
         }
 
-        if (MemoryManager.isMemoryPressure()) {
-            MemoryManager.forceGarbageCollection();
-        }
     }
 
     private static void extractUsingStreaming(Path zipFilePath, Path targetDir,
@@ -65,7 +62,6 @@ public class StreamingZipExtractor {
                 zis.closeEntry();
 
                 if (MemoryManager.isMemoryPressure()) {
-                    MemoryManager.forceGarbageCollection();
                     MemoryManager.MemoryInfo newInfo = MemoryManager.getCurrentMemoryInfo();
                     if (newInfo.optimalBufferSize != bufferSize && newInfo.optimalBufferSize > 0) {
                         buffer = new byte[newInfo.optimalBufferSize];
@@ -138,18 +134,36 @@ public class StreamingZipExtractor {
              FileChannel outputChannel = FileChannel.open(targetPath,
                      StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            long transferred = 0;
             long size = entry.getSize();
+            long transferred = 0;
             long chunkSize = Math.min(bufferSize * 8L, 32 * 1024 * 1024);
+            int zeroCount = 0;
+            final int MAX_ZERO_READS = 10;
 
             while (transferred < size) {
-                long count = outputChannel.transferFrom(inputChannel, transferred,
-                        Math.min(chunkSize, size - transferred));
-                if (count <= 0) break;
-                transferred += count;
+                long remaining = size - transferred;
+                long count = outputChannel.transferFrom(inputChannel, transferred, Math.min(chunkSize, remaining));
 
-                if (transferred % (chunkSize * 4) == 0 && MemoryManager.isMemoryPressure()) {
-                    MemoryManager.forceGarbageCollection();
+                if (count == 0) {
+                    // transferFrom puede retornar 0 sin haber terminado en algunos OS
+                    if (++zeroCount >= MAX_ZERO_READS) break;
+                    continue;
+                }
+
+                zeroCount = 0;
+                transferred += count;
+            }
+
+            // Fallback: si transferFrom no completó, copiar el resto byte a byte
+            if (transferred < size) {
+                outputChannel.position(transferred);
+                byte[] buffer = new byte[bufferSize];
+                int bytesRead;
+                try (InputStream fallbackStream = zipFile.getInputStream(entry)) {
+                    fallbackStream.skip(transferred);
+                    while ((bytesRead = fallbackStream.read(buffer)) != -1) {
+                        outputChannel.write(java.nio.ByteBuffer.wrap(buffer, 0, bytesRead));
+                    }
                 }
             }
         }
@@ -189,10 +203,6 @@ public class StreamingZipExtractor {
             }
         }
 
-        return true;
-    }
-
-    public static boolean shouldProcessEntry(String entryName, List<String> allowedFolders) {
-        return true;
+        return false;
     }
 }

@@ -5,16 +5,29 @@ import bundle.settings.AppSettings;
 
 import com.formdev.flatlaf.FlatDarkLaf;
 import com.formdev.flatlaf.FlatLightLaf;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.swing.*;
 import java.awt.*;
+import java.io.PrintStream;
 
 public class App {
 
+    private static final Logger log = LoggerFactory.getLogger(App.class);
+
     public static void main(String[] args) {
-        System.out.println("[DEBUG] === INICIANDO BUNDLE INSTALLER ===");
-        System.out.println("[DEBUG] Java Version: " + System.getProperty("java.version"));
-        System.out.println("[DEBUG] OS: " + System.getProperty("os.name"));
+        // Fix encoding UTF-8 en Windows
+        try {
+            System.setOut(new PrintStream(System.out, true, "UTF-8"));
+            System.setErr(new PrintStream(System.err, true, "UTF-8"));
+        } catch (Exception e) {
+            System.err.println("No se pudo configurar UTF-8: " + e.getMessage());
+        }
+
+        log.info("=== INICIANDO BUNDLE INSTALLER ===");
+        log.info("Java Version: {}", System.getProperty("java.version"));
+        log.info("OS: {}", System.getProperty("os.name"));
 
         System.setProperty("flatlaf.useWindowDecorations", "false");
         System.setProperty("sun.awt.noerasebackground", "true");
@@ -27,15 +40,12 @@ public class App {
             try {
                 BundleInstaller installer = new BundleInstaller();
 
-                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                    BundleInstaller.shutdown();
-                }));
+                Runtime.getRuntime().addShutdownHook(new Thread(BundleInstaller::shutdown));
 
                 installer.openUI();
 
             } catch (Exception e) {
-                System.err.println("Error fatal al inicializar la aplicacion: " + e.getMessage());
-                e.printStackTrace();
+                log.error("Error fatal al inicializar la aplicacion: {}", e.getMessage(), e);
 
                 JOptionPane.showMessageDialog(null,
                         "Error fatal al inicializar la aplicacion:\n" + e.getMessage(),
@@ -51,14 +61,12 @@ public class App {
         try {
             AppSettings settings = AppSettings.getInstance();
             applyTheme(settings.isDarkMode());
-
         } catch (Exception e) {
-            System.err.println("Error configurando Look and Feel: " + e.getMessage());
-
+            log.error("Error configurando Look and Feel: {}", e.getMessage());
             try {
                 UIManager.setLookAndFeel(UIManager.getLookAndFeel());
             } catch (Exception fallbackError) {
-                System.err.println("Error con fallback Look and Feel: " + fallbackError.getMessage());
+                log.error("Error con fallback Look and Feel: {}", fallbackError.getMessage());
             }
         }
     }
@@ -67,10 +75,10 @@ public class App {
         try {
             if (isDarkMode) {
                 UIManager.setLookAndFeel(new FlatDarkLaf());
-                System.out.println("Tema oscuro aplicado");
+                log.info("Tema oscuro aplicado");
             } else {
                 UIManager.setLookAndFeel(new FlatLightLaf());
-                System.out.println("Tema claro aplicado");
+                log.info("Tema claro aplicado");
             }
 
             setupCustomUIProperties(isDarkMode);
@@ -81,14 +89,12 @@ public class App {
             }
 
         } catch (Exception e) {
-            System.err.println("Error aplicando tema: " + e.getMessage());
-            e.printStackTrace();
+            log.error("Error aplicando tema: {}", e.getMessage(), e);
         }
     }
 
     private static void setupCustomUIProperties(boolean isDarkMode) {
         JFrame.setDefaultLookAndFeelDecorated(false);
-
         UIManager.put("swing.boldMetal", Boolean.FALSE);
 
         Font defaultFont = new Font("Segoe UI", Font.PLAIN, 13);

@@ -1,6 +1,12 @@
 plugins {
-    id 'application'
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.6'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 repositories {
@@ -8,22 +14,13 @@ repositories {
 }
 
 dependencies {
-    testImplementation 'junit:junit:4.13.1'
-    implementation 'com.google.code.gson:gson:2.10.1'
-    implementation 'org.jetbrains:annotations:24.0.1'
-    implementation 'com.formdev:flatlaf:3.1'
+    testImplementation 'junit:junit:4.13.2'
+    implementation 'com.google.code.gson:gson:2.11.0'
+    implementation 'org.jetbrains:annotations:24.1.0'
+    implementation 'com.formdev:flatlaf:3.5.4'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
-}
-
-application {
-    mainClass = 'bundle.App'
-}
-
-shadowJar {
-    archiveBaseName.set("${project.archive_base_name}")
-    archiveVersion.set("${project.archive_version}")
-    archiveClassifier.set("${project.archive_classifier}")
-    mainClassName = 'bundle.App'
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    implementation 'org.slf4j:slf4j-simple:2.0.16'
 }
 
 jar {
@@ -31,3 +28,19 @@ jar {
         attributes 'Main-Class': 'bundle.App'
     }
 }
+
+shadowJar {
+    archiveBaseName.set("${project.archive_base_name}")
+    archiveVersion.set("${project.archive_version}")
+    archiveClassifier.set("${project.archive_classifier}")
+    manifest {
+        attributes 'Main-Class': 'bundle.App'
+    }
+}
+
+tasks.register('run', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'bundle.App'
+}
+
+tasks.named('jar').configure { enabled = false }

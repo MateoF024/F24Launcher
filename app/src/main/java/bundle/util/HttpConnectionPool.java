@@ -1,10 +1,16 @@
 package bundle.util;
 
 import okhttp3.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 public class HttpConnectionPool {
+
+    private static final Logger log = LoggerFactory.getLogger(HttpConnectionPool.class);
+
     private static HttpConnectionPool instance;
     private final OkHttpClient client;
 
@@ -40,7 +46,6 @@ public class HttpConnectionPool {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP Error " + response.code() + " for URL: " + url);
             }
-
             ResponseBody body = response.body();
             return body != null ? body.string() : "";
         }
@@ -56,10 +61,26 @@ public class HttpConnectionPool {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP Error " + response.code() + " for URL: " + url);
             }
-
             ResponseBody body = response.body();
             return body != null ? body.bytes() : new byte[0];
         }
+    }
+
+    // Fase 3 #16 — Devuelve Response sin cerrar, el caller la maneja con try-with-resources
+    public Response getRaw(String url) throws IOException {
+        Request request = new Request.Builder()
+                .url(url)
+                .addHeader("User-Agent", "MateoF24-ModpackInstaller/3.0")
+                .addHeader("Accept", "*/*")
+                .addHeader("Cache-Control", "no-cache")
+                .build();
+
+        Response response = client.newCall(request).execute();
+        if (!response.isSuccessful()) {
+            response.close();
+            throw new IOException("HTTP Error " + response.code() + " for URL: " + url);
+        }
+        return response;
     }
 
     public void shutdown() {
@@ -82,19 +103,22 @@ public class HttpConnectionPool {
                     if (response.isSuccessful()) {
                         return response;
                     }
+                    // Fase 2 #10 — No reintentar errores de cliente
                     if (response.code() >= 400 && response.code() < 500) {
                         return response;
                     }
-                    if (response != null) {
-                        response.close();
-                    }
+                    // Fase 2 #10 — Cerrar antes de reintentar, evita NPE
+                    response.close();
+                    response = null;
                 } catch (IOException e) {
                     lastException = e;
-                    if (i == MAX_RETRIES - 1) {
-                        throw e;
+                    if (response != null) {
+                        response.close();
+                        response = null;
                     }
+                    if (i == MAX_RETRIES - 1) throw e;
                     try {
-                        Thread.sleep(1000 * (i + 1));
+                        Thread.sleep(1000L * (i + 1));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw new IOException("Interrupted during retry", ie);
@@ -102,11 +126,9 @@ public class HttpConnectionPool {
                 }
             }
 
-            if (lastException != null) {
-                throw lastException;
-            }
-
-            return response;
+            if (lastException != null) throw lastException;
+            if (response != null) return response;
+            throw new IOException("Failed after " + MAX_RETRIES + " retries: " + request.url());
         }
     }
 }
