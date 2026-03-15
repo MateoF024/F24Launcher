@@ -34,6 +34,7 @@ public class App {
         System.setProperty("sun.java2d.d3d", "false");
         System.setProperty("sun.java2d.noddraw", "true");
 
+        registerSystemEmojiFonts();
         setupLookAndFeel();
 
         SwingUtilities.invokeLater(() -> {
@@ -55,6 +56,23 @@ public class App {
                 System.exit(1);
             }
         });
+    }
+
+    private static void registerSystemEmojiFonts() {
+        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+        String[] candidates = {
+                "C:/Windows/Fonts/seguiemj.ttf",
+                "C:/Windows/Fonts/seguisym.ttf",
+                "/System/Library/Fonts/Apple Color Emoji.ttc",
+                "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                "/usr/share/fonts/noto/NotoColorEmoji.ttf"
+        };
+        for (String path : candidates) {
+            try {
+                Font f = Font.createFont(Font.TRUETYPE_FONT, new java.io.File(path));
+                ge.registerFont(f);
+            } catch (Exception ignored) {}
+        }
     }
 
     private static void setupLookAndFeel() {

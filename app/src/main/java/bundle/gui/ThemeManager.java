@@ -2,14 +2,38 @@ package bundle.gui;
 
 import bundle.settings.AppSettings;
 import java.awt.*;
+import java.awt.GraphicsEnvironment;
+import java.util.Set;
 
 public class ThemeManager {
 
     // #13 — Fuentes cacheadas como constantes
-    private static final Font FONT_NORMAL = new Font("Segoe UI", Font.PLAIN, 13);
-    private static final Font FONT_BOLD   = new Font("Segoe UI", Font.BOLD, 13);
-    private static final Font FONT_SMALL  = new Font("Segoe UI", Font.PLAIN, 11);
-    private static final Font FONT_LARGE  = new Font("Segoe UI", Font.BOLD, 15);
+
+    private static final Font FONT_NORMAL;
+    private static final Font FONT_BOLD;
+    private static final Font FONT_SMALL;
+    private static final Font FONT_LARGE;
+
+    static {
+        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+        Set<String> fonts = new java.util.HashSet<>(java.util.Arrays.asList(ge.getAvailableFontFamilyNames()));
+        String preferred = fonts.contains("Segoe UI") ? "Segoe UI" : Font.DIALOG;
+        FONT_NORMAL = buildFont(preferred, Font.PLAIN,  13);
+        FONT_BOLD   = buildFont(preferred, Font.BOLD,   13);
+        FONT_SMALL  = buildFont(preferred, Font.PLAIN,  11);
+        FONT_LARGE  = buildFont(preferred, Font.BOLD,   15);
+    }
+
+    private static Font buildFont(String family, int style, int size) {
+        if (family.equals(Font.DIALOG)) return new Font(Font.DIALOG, style, size);
+        java.util.Map<java.awt.font.TextAttribute, Object> attrs = new java.util.HashMap<>();
+        attrs.put(java.awt.font.TextAttribute.FAMILY, family);
+        attrs.put(java.awt.font.TextAttribute.WEIGHT,
+                style == Font.BOLD ? java.awt.font.TextAttribute.WEIGHT_BOLD
+                        : java.awt.font.TextAttribute.WEIGHT_REGULAR);
+        attrs.put(java.awt.font.TextAttribute.SIZE, (float) size);
+        return Font.getFont(attrs);
+    }
 
     // #14 — Estado de tema cacheado, evita llamar AppSettings en cada repaint
     private static boolean darkMode = AppSettings.getInstance().isDarkMode();

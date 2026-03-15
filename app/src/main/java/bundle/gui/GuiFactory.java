@@ -264,4 +264,37 @@ public final class GuiFactory {
             resultLabel.setForeground(color);
         }
     }
+
+    public static JButton createIconButton(String fallbackText, int width, int height, java.util.function.Consumer<Graphics2D> iconPainter) {
+        JButton button = new JButton() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                ThemeManager.Colors colors = ThemeManager.getCurrentColors();
+                if (getModel().isPressed()) g2.setColor(colors.primary.darker());
+                else if (getModel().isRollover() && isEnabled()) g2.setColor(colors.buttonHover);
+                else if (isEnabled()) g2.setColor(colors.primary);
+                else g2.setColor(colors.progressBackground);
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 12, 12);
+                g2.setColor(Color.WHITE);
+                if (iconPainter != null) {
+                    iconPainter.accept(g2);
+                } else {
+                    g2.setFont(ThemeManager.getBoldFont());
+                    FontMetrics fm = g2.getFontMetrics();
+                    int tx = (getWidth() - fm.stringWidth(fallbackText)) / 2;
+                    int ty = (getHeight() + fm.getAscent()) / 2 - 2;
+                    g2.drawString(fallbackText, tx, ty);
+                }
+                g2.dispose();
+            }
+        };
+        button.setPreferredSize(new Dimension(width, height));
+        button.setFocusPainted(false);
+        button.setBorderPainted(false);
+        button.setContentAreaFilled(false);
+        button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return button;
+    }
 }
