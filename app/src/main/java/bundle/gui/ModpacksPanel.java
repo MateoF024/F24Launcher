@@ -27,6 +27,7 @@ public class ModpacksPanel extends JPanel {
 
     private JPanel mainPanel;
 
+
     // Componentes compartidos via GuiFactory
     private GuiFactory.ProgressPanelComponents progressComponents;
     private GuiFactory.ResultPanelComponents resultComponents;

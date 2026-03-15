@@ -13,11 +13,14 @@ public class NavigationPanel extends JPanel {
     private final Runnable modpacksCallback;
     private final Runnable loadersCallback;
     private final Runnable settingsCallback;
+    private final Runnable modsCallback;
     private String selectedButtonKey = "MODPACKS";
 
-    public NavigationPanel(Runnable modpacksCallback, Runnable loadersCallback, Runnable settingsCallback) {
+    public NavigationPanel(Runnable modpacksCallback, Runnable loadersCallback,
+                           Runnable modsCallback, Runnable settingsCallback) {
         this.modpacksCallback = modpacksCallback;
         this.loadersCallback = loadersCallback;
+        this.modsCallback = modsCallback;
         this.settingsCallback = settingsCallback;
 
         setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
@@ -32,6 +35,7 @@ public class NavigationPanel extends JPanel {
     private void createButtons() {
         buttons.put("MODPACKS", createNavButton("Modpacks", modpacksCallback, "MODPACKS"));
         buttons.put("LOADERS", createNavButton("Loaders", loadersCallback, "LOADERS"));
+        buttons.put("MODS", createNavButton("Mods", modsCallback, "MODS"));
         buttons.put("SETTINGS", createNavButton("Configuración", settingsCallback, "SETTINGS"));
     }
 
@@ -39,6 +43,8 @@ public class NavigationPanel extends JPanel {
         add(buttons.get("MODPACKS"));
         add(Box.createVerticalStrut(10));
         add(buttons.get("LOADERS"));
+        add(Box.createVerticalStrut(10));
+        add(buttons.get("MODS"));
         add(Box.createVerticalStrut(10));
         add(buttons.get("SETTINGS"));
         add(Box.createVerticalGlue());

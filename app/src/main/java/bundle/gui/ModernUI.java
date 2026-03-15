@@ -17,15 +17,16 @@ import java.util.List;
 public class ModernUI extends JFrame {
     private final BundleInstaller installer;
     private final AppSettings appSettings;
-
     private CustomTitleBar titleBar;
     private NavigationPanel navigationPanel;
     private JPanel contentPanel;
     private CardLayout cardLayout;
-
     private ModpacksPanel modpacksPanel;
     private LoadersPanel loadersPanel;
     private SettingsPanel settingsPanel;
+    private final bundle.instance.InstanceManager instanceManager = new bundle.instance.InstanceManager();
+    private ModManagerPanel modManagerPanel;
+
 
     public ModernUI(BundleInstaller installer) {
         this.installer = installer;
@@ -50,7 +51,7 @@ public class ModernUI extends JFrame {
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setUndecorated(true);
         setResizable(false);
-        setSize(900, 600);
+        setSize(1100, 680);
 
         System.out.println("[DEBUG] Frame configurado");
     }
@@ -95,6 +96,7 @@ public class ModernUI extends JFrame {
         navigationPanel = new NavigationPanel(
                 this::showModpacksPanel,
                 this::showLoadersPanel,
+                this::showModManagerPanel,
                 this::showSettingsPanel
         );
 
@@ -104,10 +106,12 @@ public class ModernUI extends JFrame {
 
         modpacksPanel = new ModpacksPanel(installer);
         loadersPanel = new LoadersPanel(installer);
+        modManagerPanel = new ModManagerPanel(instanceManager);
         settingsPanel = new SettingsPanel(installer, this::updateTheme);
 
         contentPanel.add(modpacksPanel, "MODPACKS");
         contentPanel.add(loadersPanel, "LOADERS");
+        contentPanel.add(modManagerPanel, "MODS");
         contentPanel.add(settingsPanel, "SETTINGS");
 
         System.out.println("[DEBUG] Componentes creados");
@@ -160,6 +164,11 @@ public class ModernUI extends JFrame {
         navigationPanel.selectButton("SETTINGS");
     }
 
+    private void showModManagerPanel() {
+        cardLayout.show(contentPanel, "MODS");
+        navigationPanel.selectButton("MODS");
+    }
+
     public void updateTheme() {
         SwingUtilities.invokeLater(() -> {
             try {
@@ -172,6 +181,7 @@ public class ModernUI extends JFrame {
                 if (modpacksPanel != null) modpacksPanel.updateTheme();
                 if (loadersPanel != null) loadersPanel.updateTheme();
                 if (settingsPanel != null) settingsPanel.updateTheme();
+                if (modManagerPanel != null) modManagerPanel.updateTheme();
 
                 if (contentPanel != null) {
                     contentPanel.setBackground(colors.background);
@@ -200,6 +210,7 @@ public class ModernUI extends JFrame {
             if (comp instanceof ModpacksPanel ||
                     comp instanceof LoadersPanel  ||
                     comp instanceof SettingsPanel ||
+                    comp instanceof ModManagerPanel ||
                     comp instanceof NavigationPanel) {
                 continue;
             }

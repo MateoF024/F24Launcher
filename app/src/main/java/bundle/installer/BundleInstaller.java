@@ -6,6 +6,13 @@ import bundle.gui.BundleGuiApp;
 import bundle.loader.LoaderManager;
 import bundle.settings.AppSettings;
 import bundle.util.*;
+import bundle.modpack.CurseForgeInstaller;
+import bundle.modpack.ModpackFormat;
+import bundle.modpack.MrpackInstaller;
+import bundle.mods.ModSearchService;
+import java.util.ArrayList;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -19,7 +26,6 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.zip.ZipFile;
 
 public final class BundleInstaller {
 
@@ -145,20 +151,44 @@ public final class BundleInstaller {
     }
 
     private void processZipFilesWithProgress(Path directory, ProgressCallback progressCallback) throws IOException {
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, "*.zip")) {
-            for (Path zipFile : stream) {
-                long estimated = estimateFileCount(getZipSize(zipFile));
-                ExtractionProgressTracker tracker = new ExtractionProgressTracker(
-                        progressCallback, "Extracción", estimated);
-
-                StreamingZipExtractor.extractWithProgress(zipFile, directory,
-                        appSettings.getFoldersToInstall(), tracker);
-
-                Files.deleteIfExists(zipFile);
-                tracker.complete();
-            }
+        List<Path> packFiles = new ArrayList<>();
+        try (DirectoryStream<Path> s = Files.newDirectoryStream(directory, "*.zip")) {
+            for (Path f : s) packFiles.add(f);
         }
+        try (DirectoryStream<Path> s = Files.newDirectoryStream(directory, "*.mrpack")) {
+            for (Path f : s) packFiles.add(f);
+        }
+
+        for (Path packFile : packFiles) {
+            ModpackFormat format = detectPackFormat(packFile);
+            switch (format) {
+                case MRPACK -> new MrpackInstaller().install(packFile, directory, progressCallback);
+                case CURSEFORGE -> new CurseForgeInstaller().install(packFile, directory, progressCallback);
+                case ZIP -> {
+                    long estimated = estimateFileCount(getZipSize(packFile));
+                    ExtractionProgressTracker tracker = new ExtractionProgressTracker(progressCallback, "Extracción", estimated);
+                    StreamingZipExtractor.extractWithProgress(packFile, directory, appSettings.getFoldersToInstall(), tracker);
+                    tracker.complete();
+                }
+            }
+            Files.deleteIfExists(packFile);
+        }
+
         if (progressCallback != null) progressCallback.onAllComplete();
+    }
+
+    private ModpackFormat detectPackFormat(Path file) {
+        if (file.getFileName().toString().toLowerCase().endsWith(".mrpack")) return ModpackFormat.MRPACK;
+        try (ZipFile zip = new ZipFile(file.toFile())) {
+            if (zip.getEntry("modrinth.index.json") != null) return ModpackFormat.MRPACK;
+            ZipEntry manifest = zip.getEntry("manifest.json");
+            if (manifest != null) {
+                try (InputStream is = zip.getInputStream(manifest)) {
+                    if (new String(is.readAllBytes()).contains("minecraftModpack")) return ModpackFormat.CURSEFORGE;
+                }
+            }
+        } catch (Exception ignored) {}
+        return ModpackFormat.ZIP;
     }
 
     private long getZipSize(Path zipFile) {
@@ -230,5 +260,6 @@ public final class BundleInstaller {
     public static void shutdown() {
         HttpConnectionPool.getInstance().shutdown();
         LoaderManager.shutdown();
+        ModSearchService.shutdown();
     }
 }
