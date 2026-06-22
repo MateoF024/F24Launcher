@@ -1,7 +1,16 @@
 # Gradle
 .gradle/
-app/build/
+build/
+backend/build/
 !gradle/wrapper/gradle-wrapper.jar
+
+# Frontend / Tauri (generados)
+frontend/node_modules/
+frontend/build/
+frontend/.svelte-kit/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+frontend/src-tauri/resources/
 
 # IntelliJ IDEA
 .idea/
@@ -9,6 +18,9 @@ app/build/
 *.ipr
 *.iws
 out/
+
+# VS Code (preferencias locales)
+.vscode/
 
 # Sistema operativo
 .DS_Store
@@ -22,3 +34,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Documentación interna y notas de desarrollo (no se publican)
+/docs/
+/roadmap.md
+/GETTING_STARTED.md
