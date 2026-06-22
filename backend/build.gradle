@@ -1,0 +1,244 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.6'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    implementation 'com.google.code.gson:gson:2.11.0'
+    implementation 'org.jetbrains:annotations:24.1.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    implementation 'org.slf4j:slf4j-simple:2.0.16'
+    // Servidor IPC local embebido (HTTP + WebSocket) para hablar con el frontend.
+    implementation 'io.javalin:javalin:6.3.0'
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'f24launcher.App'
+    }
+}
+
+shadowJar {
+    archiveBaseName.set("${project.archive_base_name}")
+    archiveVersion.set("${project.archive_version}")
+    archiveClassifier.set("${project.archive_classifier}")
+    manifest {
+        attributes 'Main-Class': 'f24launcher.App'
+    }
+}
+
+tasks.register('run', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'f24launcher.App'
+}
+
+tasks.named('jar').configure { enabled = false }
+
+// ─── Distribución standalone Windows (.exe único) ───
+
+def jlinkModules = 'java.base,java.compiler,java.desktop,java.logging,java.management,java.naming,java.net.http,java.security.jgss,java.sql,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.unsupported,jdk.zipfs'
+def appName = 'F24Launcher'
+def appVersion = project.archive_version.replace('v', '')
+def jpackageDir = layout.buildDirectory.dir('jpackage').get().asFile
+def sfxDir = layout.buildDirectory.dir('sfx').get().asFile
+def runtimeDir = layout.buildDirectory.dir('jlink-runtime').get().asFile
+def finalOutputDir = rootProject.layout.buildDirectory.dir('libs').get().asFile
+
+tasks.register('jlinkRuntime', Exec) {
+    group = 'distribution'
+    dependsOn 'shadowJar'
+    outputs.upToDateWhen { false }
+
+    def javaHome = System.getProperty('java.home') ?: System.getenv('JAVA_HOME')
+    def isWin = System.getProperty('os.name').toLowerCase().contains('win')
+    def jlinkExe = "${javaHome}/bin/jlink" + (isWin ? '.exe' : '')
+
+    doFirst {
+        if (runtimeDir.exists()) runtimeDir.deleteDir()
+    }
+
+    commandLine jlinkExe,
+        '--add-modules', jlinkModules,
+        '--strip-debug',
+        '--no-man-pages',
+        '--no-header-files',
+        '--compress=zip-9',
+        '--output', runtimeDir.absolutePath
+}
+
+tasks.register('jpackageApp', Exec) {
+    group = 'distribution'
+    dependsOn 'jlinkRuntime', 'generateIco'
+    outputs.upToDateWhen { false }
+
+    def javaHome = System.getProperty('java.home') ?: System.getenv('JAVA_HOME')
+    def jpackageExe = "${javaHome}/bin/jpackage"
+    def shadowJarFile = tasks.shadowJar.archiveFile.get().asFile
+    def icoFile = new File(sfxDir, 'icon.ico')
+
+    doFirst {
+        if (jpackageDir.exists()) jpackageDir.deleteDir()
+    }
+
+    def args = [
+        jpackageExe,
+        '--type', 'app-image',
+        '--name', appName,
+        '--app-version', appVersion,
+        '--input', shadowJarFile.parentFile.absolutePath,
+        '--main-jar', shadowJarFile.name,
+        '--main-class', 'f24launcher.App',
+        '--runtime-image', runtimeDir.absolutePath,
+        '--dest', jpackageDir.absolutePath,
+        '--java-options', '-Xmx512m',
+        '--java-options', '-Dsun.java2d.d3d=false',
+        '--icon', icoFile.absolutePath
+    ]
+    commandLine args
+}
+
+tasks.register('zipAppContents', Zip) {
+    group = 'distribution'
+    dependsOn 'jpackageApp'
+    outputs.upToDateWhen { false }
+
+    archiveFileName = 'app-contents.zip'
+    destinationDirectory = sfxDir
+    from("${jpackageDir}/${appName}")
+}
+
+tasks.register('generateIco') {
+    group = 'distribution'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        sfxDir.mkdirs()
+        def pngFile = file('src/main/resources/icon.png')
+        if (!pngFile.exists()) {
+            throw new GradleException('icon.png not found in resources')
+        }
+
+        def icoFile = new File(sfxDir, 'icon.ico')
+        def pngBytes = pngFile.bytes
+        def img = javax.imageio.ImageIO.read(pngFile)
+        int w = Math.min(img.width, 256)
+        int h = Math.min(img.height, 256)
+
+        def bos = new ByteArrayOutputStream()
+        bos.write([0,0, 1,0, 1,0] as byte[])
+        bos.write((w == 256 ? 0 : w) as byte)
+        bos.write((h == 256 ? 0 : h) as byte)
+        bos.write([0, 0] as byte[])
+        bos.write([1, 0] as byte[])
+        bos.write([32, 0] as byte[])
+        int sz = pngBytes.length
+        bos.write([sz & 0xFF, (sz >> 8) & 0xFF, (sz >> 16) & 0xFF, (sz >> 24) & 0xFF] as byte[])
+        bos.write([22, 0, 0, 0] as byte[])
+        bos.write(pngBytes)
+
+        icoFile.bytes = bos.toByteArray()
+        println "ICO generated: ${icoFile.absolutePath} (${w}x${h})"
+    }
+}
+
+tasks.register('compileSfxLauncher') {
+    group = 'distribution'
+    dependsOn 'generateIco'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        sfxDir.mkdirs()
+
+        def cscPath = 'C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+        if (!file(cscPath).exists()) {
+            cscPath = 'C:/Windows/Microsoft.NET/Framework/v4.0.30319/csc.exe'
+        }
+        if (!file(cscPath).exists()) {
+            throw new GradleException('.NET Framework csc.exe not found. Required for SFX build.')
+        }
+
+        def srcFile = file('sfx/SfxLauncher.cs')
+        if (!srcFile.exists()) {
+            throw new GradleException('sfx/SfxLauncher.cs not found')
+        }
+
+        def processedSrc = new File(sfxDir, 'SfxLauncher.cs')
+        def buildStamp = project.archive_version + '-' + System.currentTimeMillis()
+        processedSrc.text = srcFile.text.replace('%%VERSION%%', buildStamp)
+
+        def icoFile = new File(sfxDir, 'icon.ico')
+        def outExe = new File(sfxDir, 'SfxLauncher.exe')
+        def args = [cscPath,
+                '/target:winexe', '/nologo', '/optimize+', '/platform:x64',
+                "/out:${outExe.absolutePath}".toString()]
+        if (icoFile.exists()) {
+            args.add("/win32icon:${icoFile.absolutePath}".toString())
+        }
+        args.add(processedSrc.absolutePath)
+
+        def pb = new ProcessBuilder(args)
+        pb.redirectErrorStream(true)
+        def proc = pb.start()
+        def output = proc.inputStream.text
+        def exitCode = proc.waitFor()
+        if (exitCode != 0) {
+            throw new GradleException("csc.exe failed (exit ${exitCode}):\n${output}")
+        }
+        println "SFX launcher compiled: ${outExe.absolutePath}"
+    }
+}
+
+tasks.register('buildPortableExe') {
+    group = 'distribution'
+    dependsOn 'zipAppContents', 'compileSfxLauncher'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        finalOutputDir.mkdirs()
+
+        def launcher = new File(sfxDir, 'SfxLauncher.exe')
+        def zipFile = new File(sfxDir, 'app-contents.zip')
+        def output = new File(finalOutputDir, "${appName}.exe")
+
+        if (!launcher.exists()) throw new GradleException("SFX launcher not found: ${launcher}")
+        if (!zipFile.exists()) throw new GradleException("App ZIP not found: ${zipFile}")
+
+        def fos = new FileOutputStream(output)
+        fos.write(launcher.bytes)
+
+        byte[] zipData = zipFile.bytes
+        fos.write(zipData)
+
+        long size = zipData.length
+        def sizeBytes = new byte[8]
+        for (int i = 0; i < 8; i++) {
+            sizeBytes[i] = (byte)(size & 0xFF)
+            size >>= 8
+        }
+        fos.write(sizeBytes)
+        fos.write('F24SFX00'.getBytes('ASCII'))
+        fos.close()
+
+        def sizeMB = String.format('%.1f', output.length() / (1024.0 * 1024.0))
+        println ''
+        println '═══════════════════════════════════════════'
+        println " Portable EXE: ${output.absolutePath}"
+        println " Size: ${sizeMB} MB"
+        println '═══════════════════════════════════════════'
+    }
+}
+
+// El empaquetado de F24Launcher pasa a Tauri (Fase 6). El pipeline SFX/jpackage
+// de abajo queda como referencia y NO se engancha al ciclo 'build'.

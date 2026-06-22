@@ -1,0 +1,57 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "F24Launcher",
+  "version": "0.0.1",
+  "identifier": "com.f24.launcher",
+  "build": {
+    "frontendDist": "../build",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "F24Launcher",
+        "width": 1440,
+        "height": 810,
+        "minWidth": 1024,
+        "minHeight": 576,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "MateoF24",
+    "copyright": "© 2026 MateoF24",
+    "category": "Game",
+    "shortDescription": "Launcher privado de Minecraft: Java Edition",
+    "longDescription": "F24Launcher — cliente privado para Minecraft: Java Edition. Gestiona instancias, mods, modpacks y cuentas.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/F24Launcher-backend.jar",
+      "resources/jre/**/*"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Spanish"]
+      }
+    },
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

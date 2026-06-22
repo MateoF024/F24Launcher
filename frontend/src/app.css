@@ -1,0 +1,120 @@
+/* Tema base F24Launcher — oscuro, inspirado en Modrinth App. */
+:root {
+	--bg: #16181c;
+	--bg-elev: #1c1f26;
+	--bg-card: #21252e;
+	--border: #2c313c;
+	--text: #e6e8ee;
+	--text-dim: #9aa3b2;
+	--accent: #fcba03;
+	--accent-dim: #d99e02;
+	--radius: 10px;
+	--font: 'Inter', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* Tema claro (se activa con data-theme="light" en <html>). */
+:root[data-theme='light'] {
+	--bg: #f3f4f7;
+	--bg-elev: #ffffff;
+	--bg-card: #ffffff;
+	--border: #dfe2e9;
+	--text: #1b1e25;
+	--text-dim: #5d6675;
+	--accent: #e0a000;
+	--accent-dim: #c08a00;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font);
+	font-size: 14px;
+}
+
+h1,
+h2,
+h3 {
+	margin: 0;
+	font-weight: 600;
+}
+
+button {
+	font-family: inherit;
+	cursor: pointer;
+	border: none;
+	border-radius: var(--radius);
+	padding: 8px 14px;
+	background: var(--accent);
+	color: #1c1500;
+	font-weight: 600;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 7px;
+	transition:
+		background 0.15s ease,
+		transform 0.08s ease,
+		filter 0.15s ease,
+		opacity 0.15s ease;
+}
+
+button:hover {
+	background: var(--accent-dim);
+}
+
+button:active:not(:disabled) {
+	transform: translateY(1px);
+}
+
+button.ghost {
+	background: var(--bg-card);
+	color: var(--text);
+	border: 1px solid var(--border);
+}
+
+button.ghost:hover {
+	background: var(--bg-elev);
+}
+
+a {
+	color: var(--accent);
+}
+
+/* Scrollbars finas y acordes al tema. */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+	background: var(--border);
+	border-radius: 8px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+	background: var(--text-dim);
+	background-clip: padding-box;
+}
+
+::selection {
+	background: var(--accent);
+	color: #1c1500;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	* {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

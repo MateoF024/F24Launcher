@@ -1,0 +1,249 @@
+<script lang="ts">
+	import '../app.css';
+	import { onMount } from 'svelte';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { ui, initStore, logout } from '$lib/store.svelte';
+	import Icon from '$lib/Icon.svelte';
+	import { fade } from 'svelte/transition';
+
+	let { children } = $props();
+
+	onMount(initStore);
+
+	const path = $derived($page.url.pathname);
+
+	let menuOpen = $state(false);
+	const activeAccount = $derived(ui.accounts.find((a) => a.active));
+
+	function headUrl(uuid: string, type: string, size: number) {
+		return type === 'microsoft'
+			? `https://mc-heads.net/avatar/${uuid}/${size}`
+			: `https://mc-heads.net/avatar/MHF_Steve/${size}`;
+	}
+
+	function goProfile() {
+		menuOpen = false;
+		if (activeAccount) goto(`/accounts/${activeAccount.id}`);
+	}
+
+	async function doLogout() {
+		menuOpen = false;
+		await logout();
+		goto('/accounts');
+	}
+</script>
+
+<svelte:head>
+	<link rel="icon" href="/favicon.png" />
+	<title>F24Launcher</title>
+</svelte:head>
+
+<div class="app">
+	<aside>
+		<div class="brand">F24<span>Launcher</span></div>
+		<nav>
+			<a class:active={path === '/'} href="/">Instancias</a>
+			<a class:active={path === '/modpacks'} href="/modpacks">Modpacks</a>
+			<a class:active={path === '/settings'} href="/settings">Ajustes</a>
+		</nav>
+		<div class="foot">
+			{#if activeAccount}
+				<div class="acct-wrap">
+					{#if menuOpen}
+						<div class="backdrop" role="presentation" onclick={() => (menuOpen = false)}></div>
+						<div class="acct-menu" transition:fade={{ duration: 120 }}>
+							{#if activeAccount.type === 'microsoft'}
+								<button onclick={goProfile}><Icon name="user" size={15} />Perfil</button>
+							{/if}
+							<button onclick={doLogout}><Icon name="logout" size={15} />Cerrar sesión</button>
+						</div>
+					{/if}
+					<button class="acct" class:open={menuOpen} onclick={() => (menuOpen = !menuOpen)}>
+						<img class="head" src={headUrl(activeAccount.uuid, activeAccount.type, 56)} alt="" />
+						<span class="acct-info">
+							<span class="acct-name">{activeAccount.username}</span>
+							<span class="acct-type">
+								{activeAccount.type === 'microsoft' ? 'Microsoft' : 'Offline'}
+							</span>
+						</span>
+						<span class="chev"><Icon name="chevron-down" size={15} /></span>
+					</button>
+				</div>
+			{:else}
+				<button class="acct login" onclick={() => goto('/accounts')}>
+					<Icon name="key" size={16} />Iniciar sesión
+				</button>
+			{/if}
+		</div>
+	</aside>
+	<main>
+		{#key path}
+			<div class="route" in:fade={{ duration: 140 }}>{@render children()}</div>
+		{/key}
+	</main>
+</div>
+
+<style>
+	.app {
+		display: grid;
+		grid-template-columns: 220px 1fr;
+		height: 100vh;
+	}
+	aside {
+		background: var(--bg-elev);
+		border-right: 1px solid var(--border);
+		display: flex;
+		flex-direction: column;
+		padding: 18px 14px;
+		gap: 18px;
+	}
+	.brand {
+		font-size: 20px;
+		font-weight: 700;
+		letter-spacing: 0.5px;
+	}
+	.brand span {
+		color: var(--accent);
+	}
+	nav {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	nav a {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		color: var(--text-dim);
+		text-decoration: none;
+		padding: 8px 10px;
+		border-radius: var(--radius);
+		font-weight: 500;
+		transition:
+			background 0.15s ease,
+			color 0.15s ease,
+			box-shadow 0.15s ease;
+	}
+	nav a:hover {
+		background: var(--bg-card);
+		color: var(--text);
+	}
+	nav a.active {
+		background: var(--bg-card);
+		color: var(--text);
+		box-shadow: inset 3px 0 0 var(--accent);
+	}
+	.foot {
+		margin-top: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+	.acct-wrap {
+		position: relative;
+	}
+	.acct {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		background: var(--bg-card);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 8px 10px;
+		cursor: pointer;
+		color: var(--text);
+		transition:
+			border-color 0.15s ease,
+			background 0.15s ease;
+	}
+	.acct:hover {
+		border-color: var(--accent-dim);
+	}
+	.acct.open {
+		border-color: var(--accent);
+	}
+	.head {
+		width: 28px;
+		height: 28px;
+		border-radius: 6px;
+		image-rendering: pixelated;
+		background: var(--bg-elev);
+		flex-shrink: 0;
+	}
+	.acct-info {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		flex: 1;
+		min-width: 0;
+		line-height: 1.2;
+	}
+	.acct-name {
+		font-weight: 600;
+		font-size: 13px;
+		max-width: 100%;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.acct-type {
+		font-size: 11px;
+		color: var(--text-dim);
+	}
+	.chev {
+		display: flex;
+		color: var(--text-dim);
+		transition: transform 0.15s ease;
+	}
+	.acct.open .chev {
+		transform: rotate(180deg);
+	}
+	.acct.login {
+		justify-content: center;
+		font-weight: 600;
+	}
+	.backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+	}
+	.acct-menu {
+		position: absolute;
+		bottom: 100%;
+		left: 0;
+		right: 0;
+		margin-bottom: 8px;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 6px;
+		z-index: 41;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		box-shadow: 0 10px 26px rgba(0, 0, 0, 0.4);
+	}
+	.acct-menu button {
+		display: flex;
+		align-items: center;
+		justify-content: flex-start;
+		gap: 9px;
+		width: 100%;
+		background: transparent;
+		border: none;
+		color: var(--text);
+		padding: 9px 10px;
+		border-radius: 7px;
+		font-size: 13px;
+	}
+	.acct-menu button:hover {
+		background: var(--bg-card);
+		color: var(--accent);
+	}
+	main {
+		overflow: auto;
+		padding: 28px 32px;
+	}
+</style>

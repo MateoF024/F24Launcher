@@ -1,0 +1,90 @@
+// Tareas raíz de F24Launcher.
+//
+// El proyecto son 3 capas: backend Java (Gradle, módulo :backend), frontend
+// SvelteKit (pnpm) y shell Tauri (cargo). `pnpm tauri dev` arranca el frontend
+// y lanza el backend como sidecar, así que con eso se levanta toda la app.
+
+def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
+def frontendDir = file('frontend')
+
+// Lanza la app completa: compila el jar del backend y arranca frontend + Tauri.
+tasks.register('runApp', Exec) {
+    group = 'application'
+    description = 'Compila el backend y lanza F24Launcher completo (backend + frontend + Tauri).'
+    dependsOn ':backend:shadowJar'
+    workingDir = frontendDir
+    if (isWindows) {
+        commandLine 'cmd', '/c', 'pnpm', 'tauri', 'dev'
+    } else {
+        commandLine 'pnpm', 'tauri', 'dev'
+    }
+}
+
+// Solo el backend headless (para depurar el servidor IPC sin la ventana).
+tasks.register('runBackend', JavaExec) {
+    group = 'application'
+    description = 'Arranca solo el backend Java headless (servidor IPC).'
+    dependsOn ':backend:shadowJar'
+    classpath = files(project(':backend').tasks.named('shadowJar').map { it.archiveFile })
+    mainClass = 'f24launcher.App'
+}
+
+// ─── Instalador de Windows (Tauri + NSIS) ───────────────────────────
+//
+// Empaqueta TODO lo necesario para que la app funcione en cualquier equipo:
+// el shell Tauri, el frontend compilado, el jar del backend y un JRE recortado
+// (jlink) — sin depender de que el usuario tenga Java instalado.
+//
+// El instalador final queda en:
+//   frontend/src-tauri/target/release/bundle/nsis/F24Launcher_<versión>_x64-setup.exe
+tasks.register('buildInstaller', Exec) {
+    group = 'distribution'
+    description = 'Crea el instalador NSIS de Windows (app + frontend + backend + JRE).'
+    dependsOn ':backend:shadowJar', ':backend:jlinkRuntime'
+    workingDir = frontendDir
+
+    doFirst {
+        def resDir = file('frontend/src-tauri/resources')
+        resDir.mkdirs()
+
+        // 1) jar del backend → recurso con nombre fijo.
+        def jar = project(':backend').tasks.named('shadowJar').get().archiveFile.get().asFile
+        copy {
+            from jar
+            into resDir
+            rename { 'F24Launcher-backend.jar' }
+        }
+
+        // 2) JRE recortado (jlink) → recurso jre/.
+        def jreSrc = file('backend/build/jlink-runtime')
+        if (!jreSrc.exists()) throw new GradleException("No se generó el JRE en ${jreSrc}")
+        def jreDst = file('frontend/src-tauri/resources/jre')
+        if (jreDst.exists()) jreDst.deleteDir()
+        copy {
+            from jreSrc
+            into jreDst
+        }
+        println "Recursos preparados en ${resDir}. Compilando instalador con Tauri…"
+    }
+
+    if (isWindows) {
+        commandLine 'cmd', '/c', 'pnpm', 'tauri', 'build'
+    } else {
+        commandLine 'pnpm', 'tauri', 'build'
+    }
+
+    doLast {
+        def nsisDir = file('frontend/src-tauri/target/release/bundle/nsis')
+        def setup = nsisDir.exists()
+            ? nsisDir.listFiles().find { it.name.endsWith('-setup.exe') }
+            : null
+        println ''
+        println '═══════════════════════════════════════════════════════════'
+        if (setup) {
+            println " Instalador creado: ${setup.absolutePath}"
+        } else {
+            println " Instalador en: ${nsisDir.absolutePath}"
+        }
+        println '═══════════════════════════════════════════════════════════'
+    }
+}
