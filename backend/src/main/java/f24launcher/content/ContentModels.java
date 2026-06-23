@@ -50,4 +50,18 @@ public final class ContentModels {
 
     /** Una actualización disponible para un elemento instalado. */
     public record UpdateInfo(String fileName, String type, String versionId, String versionName) {}
+
+    /**
+     * Estado de compatibilidad de un elemento instalado frente a una versión/loader
+     * objetivo (antes de aplicar el cambio). {@code status}:
+     * <ul>
+     *   <li>{@code compatible} — la versión instalada sirve tal cual.</li>
+     *   <li>{@code updatable} — existe una versión compatible distinta (la sugerida en versionId).</li>
+     *   <li>{@code incompatible} — no hay ninguna versión para esa combinación.</li>
+     *   <li>{@code unknown} — elemento sin proyecto vinculado (añadido a mano); no se puede comprobar.</li>
+     * </ul>
+     */
+    public record CompatItem(
+            String fileName, String type, String name, String status,
+            String versionId, String versionName) {}
 }

@@ -10,10 +10,14 @@
 		stopInstance,
 		deleteInstance,
 		getSettings,
-		type VanillaVersion
+		instanceIconUrl,
+		importModpack,
+		updateInstance,
+		type VanillaVersion,
+		type Instance
 	} from '$lib/ipc';
 	import { goto } from '$app/navigation';
-	import { ui, refreshInstances, setProgress, setStatus, clearError } from '$lib/store.svelte';
+	import { ui, refreshInstances, setProgress, setStatus, clearError, bumpIconBust } from '$lib/store.svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { fade, fly, scale } from 'svelte/transition';
 
@@ -22,12 +26,15 @@
 	const versions = $derived(allVersions.filter((v) => showBeta || v.type === 'release'));
 	let showCreate = $state(false);
 	let newName = $state('');
+	let newIcon = $state(''); // data-URL del icono elegido (vacío = placeholder)
 	let newVersion = $state('');
 	let newLoader = $state('vanilla');
 	let loaderVersions = $state<string[]>([]);
 	let newLoaderVersion = $state('');
 	let loadingLoaders = $state(false);
 	let creating = $state(false);
+	let importing = $state(false);
+	let importError = $state('');
 
 	// Opciones avanzadas (prerellenadas con los valores por defecto de Ajustes).
 	let advOpen = $state(false);
@@ -93,8 +100,24 @@
 	function openCreate() {
 		showCreate = true;
 		advOpen = false;
+		newIcon = '';
 		loadDefaults();
 		if (versions.length === 0) loadVersions();
+	}
+
+	/** Selector de archivo → lee la imagen como data-URL para previsualizar y enviar. */
+	function pickIcon() {
+		const input = document.createElement('input');
+		input.type = 'file';
+		input.accept = 'image/png,image/jpeg,image/gif';
+		input.onchange = () => {
+			const f = input.files?.[0];
+			if (!f) return;
+			const r = new FileReader();
+			r.onload = () => (newIcon = r.result as string);
+			r.readAsDataURL(f);
+		};
+		input.click();
 	}
 
 	async function play(id: string) {
@@ -135,10 +158,13 @@
 				maxMemoryMb: adv.maxMemoryMb,
 				windowWidth: adv.windowWidth,
 				windowHeight: adv.windowHeight,
-				jvmArgs: adv.jvmArgs
+				jvmArgs: adv.jvmArgs,
+				iconData: newIcon || undefined
 			});
+			if (newIcon) bumpIconBust();
 			showCreate = false;
 			newName = '';
+			newIcon = '';
 			newLoader = 'vanilla';
 			newLoaderVersion = '';
 			loaderVersions = [];
@@ -154,10 +180,53 @@
 		return p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
 	}
 
+	/** Importa un modpack desde un archivo local elegido en el diálogo. */
+	async function importFromFile() {
+		importError = '';
+		try {
+			const { open } = await import('@tauri-apps/plugin-dialog');
+			const path = await open({
+				multiple: false,
+				filters: [{ name: 'Modpack', extensions: ['f24pack', 'mrpack', 'zip'] }]
+			});
+			if (typeof path !== 'string') return;
+			importing = true;
+			const inst = await importModpack(path);
+			showCreate = false;
+			setProgress(inst.id, { phase: 'Importando', done: 0, total: 1 });
+			await refreshInstances();
+		} catch (e) {
+			importError = (e as Error).message;
+		} finally {
+			importing = false;
+		}
+	}
+
 	function openInstance(e: Event, id: string) {
 		if ((e.target as HTMLElement).closest('button')) return;
 		goto(`/instance/${id}`);
 	}
+
+	async function toggleFavorite(e: Event, inst: Instance) {
+		e.stopPropagation();
+		await updateInstance(inst.id, { favorite: !inst.favorite });
+		await refreshInstances();
+	}
+
+	// Agrupa las instancias por su campo `group`. Las sin grupo van primero (sin
+	// cabecera); los grupos con nombre, después, ordenados alfabéticamente.
+	const grouped = $derived.by(() => {
+		const map = new Map<string, Instance[]>();
+		for (const inst of ui.instances) {
+			const g = inst.group || '';
+			(map.get(g) ?? map.set(g, []).get(g)!).push(inst);
+		}
+		const named = [...map.keys()].filter((g) => g).sort((a, b) => a.localeCompare(b));
+		const out: { name: string; items: Instance[] }[] = [];
+		if (map.has('')) out.push({ name: '', items: map.get('')! });
+		for (const n of named) out.push({ name: n, items: map.get(n)! });
+		return out;
+	});
 </script>
 
 <header>
@@ -179,8 +248,10 @@
 		<p class="dim">Creá una nueva y se descargará e instalará automáticamente.</p>
 	</div>
 {:else}
-	<div class="grid">
-		{#each ui.instances as inst, i (inst.id)}
+	{#each grouped as section (section.name)}
+		{#if section.name}<h2 class="grouphdr">{section.name}</h2>{/if}
+		<div class="grid">
+			{#each section.items as inst, i (inst.id)}
 			{@const prog = ui.progress[inst.id]}
 			{@const state = ui.status[inst.id]}
 			<div
@@ -192,9 +263,26 @@
 				onclick={(e) => openInstance(e, inst.id)}
 				onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), goto(`/instance/${inst.id}`))}
 			>
-				<span class="name">{inst.name}</span>
-				<div class="dim meta">
-					MC {inst.mcVersion}{inst.loader && inst.loader !== 'vanilla' ? ` · ${inst.loader}` : ''}
+				<div class="head">
+					{#if inst.icon}
+						<img class="thumb" src={instanceIconUrl(inst.id, ui.iconBust)} alt="" />
+					{:else}
+						<div class="thumb ph"><Icon name="package" size={20} /></div>
+					{/if}
+					<div class="htext">
+						<span class="name">{inst.name}</span>
+						<div class="dim meta">
+							MC {inst.mcVersion}{inst.loader && inst.loader !== 'vanilla' ? ` · ${inst.loader}` : ''}
+						</div>
+					</div>
+					<button
+						class="starbtn"
+						class:on={inst.favorite}
+						title={inst.favorite ? 'Quitar de favoritas' : 'Marcar como favorita'}
+						onclick={(e) => toggleFavorite(e, inst)}
+					>
+						<Icon name="star" size={16} fill={inst.favorite} />
+					</button>
 				</div>
 
 				{#if prog}
@@ -242,8 +330,9 @@
 					</div>
 				{/if}
 			</div>
-		{/each}
-	</div>
+			{/each}
+		</div>
+	{/each}
 {/if}
 
 <!-- Modal crear -->
@@ -257,6 +346,22 @@
 			transition:scale={{ start: 0.96, duration: 170 }}
 		>
 			<h2>Nueva instancia</h2>
+			<div class="iconpick">
+				{#if newIcon}
+					<img class="prev" src={newIcon} alt="Icono elegido" />
+				{:else}
+					<div class="prev ph"><Icon name="package" size={24} /></div>
+				{/if}
+				<div class="iconbtns">
+					<button type="button" class="ghost" onclick={pickIcon}>
+						<Icon name="download" size={14} />Elegir icono…
+					</button>
+					{#if newIcon}
+						<button type="button" class="ghost danger" onclick={() => (newIcon = '')}>Quitar</button>
+					{/if}
+					<span class="dim small">PNG · se recorta a cuadrado</span>
+				</div>
+			</div>
 			<label>Nombre<input bind:value={newName} placeholder="Mi instancia" /></label>
 			<label>
 				Versión de Minecraft
@@ -319,7 +424,14 @@
 					</label>
 				</div>
 			{/if}
+			{#if importError}
+				<div class="err-box" title={importError}>{importError}</div>
+			{/if}
 			<div class="modal-actions">
+				<button type="button" class="ghost" onclick={importFromFile} disabled={importing}>
+					<Icon name="download" size={14} />{importing ? 'Importando…' : 'Desde archivo…'}
+				</button>
+				<div class="aspacer"></div>
 				<button class="ghost" onclick={() => (showCreate = false)}>Cancelar</button>
 				<button
 					onclick={doCreate}
@@ -393,16 +505,99 @@
 		border-color: var(--accent-dim);
 		transform: translateY(-2px);
 	}
+	.head {
+		display: flex;
+		align-items: center;
+		gap: 11px;
+		min-width: 0;
+	}
+	.thumb {
+		width: 40px;
+		height: 40px;
+		border-radius: 9px;
+		object-fit: cover;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		flex-shrink: 0;
+	}
+	.thumb.ph {
+		display: grid;
+		place-items: center;
+		color: var(--text-dim);
+	}
+	.htext {
+		min-width: 0;
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.starbtn {
+		background: transparent;
+		border: none;
+		padding: 4px;
+		border-radius: 6px;
+		color: var(--text-dim);
+		cursor: pointer;
+		flex-shrink: 0;
+		align-self: flex-start;
+	}
+	.starbtn:hover {
+		color: var(--accent);
+		background: var(--bg-elev);
+	}
+	.starbtn.on {
+		color: var(--accent);
+	}
+	.grouphdr {
+		font-size: 12px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.6px;
+		color: var(--text-dim);
+		margin: 20px 0 10px;
+	}
+	.grouphdr:first-child {
+		margin-top: 0;
+	}
 	.name {
 		font-weight: 600;
 		color: var(--text);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 	.card:hover .name {
 		color: var(--accent);
 	}
 	.meta {
 		font-size: 12px;
-		margin-top: -6px;
+	}
+	/* Selector de icono en el modal de creación */
+	.iconpick {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+	}
+	.prev {
+		width: 56px;
+		height: 56px;
+		border-radius: 12px;
+		object-fit: cover;
+		background: var(--bg-card);
+		border: 1px solid var(--border);
+		flex-shrink: 0;
+	}
+	.prev.ph {
+		display: grid;
+		place-items: center;
+		color: var(--text-dim);
+	}
+	.iconbtns {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 6px;
 	}
 	.row {
 		display: flex;
@@ -521,8 +716,12 @@
 	.modal-actions {
 		display: flex;
 		justify-content: flex-end;
+		align-items: center;
 		gap: 10px;
 		margin-top: 4px;
+	}
+	.aspacer {
+		flex: 1;
 	}
 	button:disabled {
 		opacity: 0.5;

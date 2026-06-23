@@ -35,6 +35,12 @@ public class ContentManifest {
         public List<String> categories;
         public String clientSide;
         public String serverSide;
+        // Datos para exportar (mrpack/.f24pack) y verificar integridad. Se rellenan
+        // al instalar desde el launcher; pueden faltar en mods añadidos a mano.
+        public String downloadUrl;
+        public String sha1;
+        public String sha512;
+        public long fileSize;
     }
 
     public List<Entry> items = new ArrayList<>();

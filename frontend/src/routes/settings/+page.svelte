@@ -7,7 +7,7 @@
 
 	let s = $state<AppSettingsDto | null>(null);
 	let saving = $state(false);
-	let version = $state('0.0.1');
+	let version = $state('0.0.2');
 
 	const SIZES = [
 		{ w: 1280, h: 720, label: '1280 × 720' },
@@ -113,6 +113,22 @@
 			</select>
 		</label>
 		<p class="dim small">Se aplica al iniciar el launcher.</p>
+		<label class="chk">
+			<input
+				type="checkbox"
+				checked={s.closeToBackground}
+				onchange={(e) => commit({ closeToBackground: e.currentTarget.checked })}
+			/>
+			Al cerrar (X), minimizar a la bandeja en vez de salir
+		</label>
+		<label class="chk">
+			<input
+				type="checkbox"
+				checked={s.minimizeOnLaunch}
+				onchange={(e) => commit({ minimizeOnLaunch: e.currentTarget.checked })}
+			/>
+			Al lanzar una instancia, pasar a segundo plano y volver al cerrarla
+		</label>
 	</section>
 
 	<section class="card">

@@ -2,6 +2,7 @@ package f24launcher.content;
 
 import f24launcher.content.ContentModels.*;
 import f24launcher.core.LauncherPaths;
+import f24launcher.core.version.VanillaInstaller;
 import f24launcher.instance.InstanceConfig;
 import f24launcher.util.HttpConnectionPool;
 
@@ -65,6 +66,10 @@ public class ContentInstaller {
         e.categories = meta != null ? meta.categories() : new ArrayList<>();
         e.clientSide = meta != null ? meta.clientSide() : "";
         e.serverSide = meta != null ? meta.serverSide() : "";
+        e.downloadUrl = version.downloadUrl();
+        e.fileSize = data.length;
+        e.sha1 = hex(data, "SHA-1");
+        e.sha512 = hex(data, "SHA-512");
 
         // Dependencias requeridas (se tratan como mods).
         for (Dependency dep : version.dependencies()) {
@@ -242,6 +247,18 @@ public class ContentInstaller {
         return s == null ? "" : s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
     }
 
+    /** Hash hexadecimal de unos bytes (p. ej. SHA-1 / SHA-512). "" si falla. */
+    public static String hex(byte[] data, String algorithm) {
+        try {
+            byte[] h = java.security.MessageDigest.getInstance(algorithm).digest(data);
+            StringBuilder sb = new StringBuilder(h.length * 2);
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private static String sha1(Path file) throws Exception {
         java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
         byte[] hash = md.digest(Files.readAllBytes(file));
@@ -252,6 +269,83 @@ public class ContentInstaller {
 
     public Path folder(InstanceConfig cfg, ContentType type) {
         return LauncherPaths.instanceGameDir(cfg.id).resolve(type.folder);
+    }
+
+    /**
+     * Copia archivos sueltos (.jar/.zip) a la carpeta de contenido de la instancia
+     * y luego identifica los nuevos. Si {@code forcedType} viene vacío, se deduce por
+     * extensión (.jar → mods, .zip → resourcepacks). Devuelve la lista resultante.
+     */
+    public List<InstalledItem> importFiles(InstanceConfig cfg, List<String> paths, String forcedType) {
+        ContentType forced = (forcedType != null && !forcedType.isBlank()) ? ContentType.from(forcedType) : null;
+        for (String ps : paths) {
+            try {
+                Path src = Paths.get(ps);
+                if (!Files.isRegularFile(src)) continue;
+                String fn = src.getFileName().toString();
+                ContentType type = forced != null ? forced : inferType(fn);
+                if (type == null) continue;
+                Path dir = folder(cfg, type);
+                Files.createDirectories(dir);
+                Files.copy(src, dir.resolve(sanitize(fn)), StandardCopyOption.REPLACE_EXISTING);
+                log.info("Importado {} a {} ({})", fn, cfg.id, type.id);
+            } catch (Exception e) {
+                log.warn("No se pudo importar {}: {}", ps, e.getMessage());
+            }
+        }
+        return identify(cfg);
+    }
+
+    /**
+     * Verifica el contenido instalado contra los hashes guardados y vuelve a
+     * descargar lo que falte o esté corrupto. Devuelve cuántos archivos se repararon.
+     */
+    public int repair(InstanceConfig cfg, VanillaInstaller.Sink sink) {
+        ContentManifest manifest = ContentManifest.load(cfg.id);
+        List<ContentManifest.Entry> checkable = new ArrayList<>();
+        for (ContentManifest.Entry e : manifest.items) {
+            if (e.downloadUrl != null && !e.downloadUrl.isBlank() && e.sha1 != null && !e.sha1.isBlank())
+                checkable.add(e);
+        }
+        long total = Math.max(1, checkable.size());
+        long done = 0;
+        int fixed = 0;
+        sink.update("Verificando contenido", 0, total);
+        for (ContentManifest.Entry e : checkable) {
+            Path dir = folder(cfg, ContentType.from(e.type));
+            Path file = dir.resolve(e.fileName);
+            boolean ok = false;
+            try {
+                if (Files.exists(file)) ok = e.sha1.equalsIgnoreCase(sha1(file));
+            } catch (Exception ex) {
+                ok = false;
+            }
+            if (!ok) {
+                try {
+                    byte[] data = HttpConnectionPool.getInstance().getBytes(e.downloadUrl);
+                    String got = hex(data, "SHA-1");
+                    if (got.equalsIgnoreCase(e.sha1)) {
+                        Files.createDirectories(dir);
+                        Files.write(file, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                        fixed++;
+                    } else {
+                        log.warn("Hash no coincide al reparar {} en {}", e.fileName, cfg.id);
+                    }
+                } catch (Exception ex) {
+                    log.warn("No se pudo reparar {}: {}", e.fileName, ex.getMessage());
+                }
+            }
+            sink.update("Verificando contenido", ++done, total);
+        }
+        log.info("Reparación de {}: {} archivo(s) restaurado(s) de {} comprobados.", cfg.id, fixed, checkable.size());
+        return fixed;
+    }
+
+    private ContentType inferType(String fileName) {
+        String f = fileName.toLowerCase(Locale.ROOT);
+        if (f.endsWith(".jar")) return ContentType.MODS;
+        if (f.endsWith(".zip")) return ContentType.RESOURCEPACKS;
+        return null;
     }
 
     /** Calcula las actualizaciones disponibles para el contenido instalado con proyecto vinculado. */
@@ -269,6 +363,44 @@ public class ContentInstaller {
                     out.add(new UpdateInfo(e.fileName, e.type, latest.id(), latest.versionNumber()));
             } catch (Exception ex) {
                 log.debug("No se pudo comprobar update de {}: {}", e.projectId, ex.getMessage());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Comprueba (sin aplicar nada) la compatibilidad del contenido instalado con
+     * una versión/loader objetivo. Para mods usa el loader objetivo; resourcepacks,
+     * shaders y datapacks no dependen del loader. Ver {@link CompatItem}.
+     */
+    public List<CompatItem> compat(InstanceConfig cfg, String targetMc, String targetLoader) {
+        ContentManifest manifest = ContentManifest.load(cfg.id);
+        List<CompatItem> out = new ArrayList<>();
+        for (ContentManifest.Entry e : manifest.items) {
+            ContentType type = ContentType.from(e.type);
+            if (e.projectId == null || e.projectId.isBlank() || e.source == null || e.source.isBlank()) {
+                out.add(new CompatItem(e.fileName, e.type, e.name, "unknown", "", ""));
+                continue;
+            }
+            try {
+                List<Version> versions = service.versions(e.source, type, e.projectId, targetMc, targetLoader, false);
+                if (versions.isEmpty()) {
+                    out.add(new CompatItem(e.fileName, e.type, e.name, "incompatible", "", ""));
+                    continue;
+                }
+                Version latest = newest(versions);
+                boolean currentOk = e.versionId != null
+                        && versions.stream().anyMatch(v -> v.id().equals(e.versionId));
+                if (currentOk && latest != null && latest.id().equals(e.versionId)) {
+                    out.add(new CompatItem(e.fileName, e.type, e.name, "compatible", e.versionId, e.versionName));
+                } else {
+                    String vid = latest != null ? latest.id() : "";
+                    String vname = latest != null ? latest.versionNumber() : "";
+                    out.add(new CompatItem(e.fileName, e.type, e.name, "updatable", vid, vname));
+                }
+            } catch (Exception ex) {
+                log.debug("compat {}: {}", e.projectId, ex.getMessage());
+                out.add(new CompatItem(e.fileName, e.type, e.name, "unknown", "", ""));
             }
         }
         return out;

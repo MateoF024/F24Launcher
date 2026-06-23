@@ -6,6 +6,7 @@ import {
 	listAccounts,
 	deleteAccount,
 	getSettings,
+	importContentFiles,
 	type Instance,
 	type Account,
 	type AppSettingsDto
@@ -34,11 +35,58 @@ export const ui = $state({
 	errors: {} as Record<string, string>, // instanceId → último error de instalación/lanzamiento
 	accounts: [] as Account[],
 	settings: null as AppSettingsDto | null,
-	auth: { stage: '', userCode: '', verificationUri: '', message: '' } as AuthFlow
+	auth: { stage: '', userCode: '', verificationUri: '', message: '' } as AuthFlow,
+	iconBust: 0, // se incrementa al cambiar un icono de instancia para refrescar los <img>
+	contentImported: 0 // se incrementa al soltar mods en una instancia (refresca su contenido)
 });
+
+// ── Drag&drop de archivos sueltos en la ventana de una instancia (E4) ──
+let contentDrop: { id: string; getType: () => string } | null = null;
+/** La página de una instancia se registra para recibir drops de .jar/.zip. */
+export function setContentDrop(t: { id: string; getType: () => string }) {
+	contentDrop = t;
+}
+export function clearContentDrop() {
+	contentDrop = null;
+}
+export function hasContentDrop() {
+	return contentDrop !== null;
+}
+
+/** Si hay una instancia escuchando y los archivos son contenido, los importa a ella. */
+export async function importDroppedFiles(paths: string[]): Promise<boolean> {
+	if (!contentDrop) return false;
+	const files = paths.filter((p) => /\.(jar|zip)$/i.test(p));
+	if (!files.length) return false;
+	try {
+		await importContentFiles(contentDrop.id, files, contentDrop.getType());
+		ui.contentImported++;
+	} catch {
+		/* el usuario verá que no apareció */
+	}
+	return true;
+}
+
+/** Fuerza recarga de los iconos de instancia (cache-bust) tras crear/editar. */
+export function bumpIconBust() {
+	ui.iconBust++;
+}
 
 let ws: WebSocket | null = null;
 let started = false;
+
+// #3 — "pasar a segundo plano al lanzar". Seguimos qué instancias están en
+// ejecución para ocultar la ventana solo al arrancar la primera y restaurarla
+// solo cuando se cierra la última (soporta varios juegos a la vez).
+const runningIds = new Set<string>();
+let backgroundedForLaunch = false;
+
+// En modo "lanzar acceso directo" (ventana oculta) no automatizamos la ventana:
+// el driver de arranque la deja oculta y cierra la app al terminar el juego.
+let launchModeActive = false;
+export function setLaunchModeActive(v: boolean) {
+	launchModeActive = v;
+}
 
 export async function initStore() {
 	if (started) return;
@@ -74,6 +122,7 @@ async function reconcile() {
 			// Si ya está instalada y todavía mostramos barra (evento perdido), la quitamos.
 			if (inst.installed && ui.progress[inst.id]) clearProgress(inst.id);
 		}
+		syncTray();
 	} catch {
 		/* el backend puede estar ocupado; reintentamos en el próximo tick */
 	}
@@ -92,6 +141,7 @@ function handleEvent(e: { type: string; data: any }) {
 			clearProgress(d.instanceId);
 			refreshInstances();
 		}
+		handleWindowOnState(d.instanceId, d.state);
 	} else if (e.type === 'log') {
 		appendLog(d.instanceId, d.line);
 	} else if (e.type === 'auth') {
@@ -119,6 +169,62 @@ export function applyTheme(dark: boolean) {
 	}
 }
 
+/** Oculta la ventana a segundo plano (igual que el botón cerrar: a la bandeja). */
+async function hideToBackground() {
+	try {
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		await getCurrentWindow().hide();
+	} catch {
+		/* fuera de Tauri */
+	}
+}
+
+/** Trae la ventana al frente y la deja fija (al terminar la última instancia). */
+async function restoreToForeground() {
+	try {
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		const w = getCurrentWindow();
+		await w.show();
+		await w.unminimize();
+		await w.setFocus();
+	} catch {
+		/* fuera de Tauri */
+	}
+}
+
+/**
+ * #3 — al lanzar, oculta la ventana a segundo plano; al terminar la última
+ * instancia en ejecución, la restaura al frente. Por transición: oculta solo al
+ * pasar de "ninguna" a "alguna" en ejecución y restaura solo al volver a cero,
+ * para que un evento repetido no provoque parpadeos.
+ */
+function handleWindowOnState(id: string, state: string) {
+	if (launchModeActive) return;
+	if (state === 'running') {
+		runningIds.add(id);
+		if (ui.settings?.minimizeOnLaunch && !backgroundedForLaunch) {
+			backgroundedForLaunch = true;
+			hideToBackground();
+		}
+	} else if (state === 'stopped' || state === 'error') {
+		runningIds.delete(id);
+		if (runningIds.size === 0 && backgroundedForLaunch) {
+			backgroundedForLaunch = false;
+			restoreToForeground();
+		}
+	}
+}
+
+/** #2 — informa a Rust si "cerrar" (X) debe ocultar a la bandeja en vez de salir. */
+async function applyCloseBehavior(toBackground: boolean) {
+	try {
+		const { invoke } = await import('@tauri-apps/api/core');
+		await invoke('set_close_to_background', { value: toBackground });
+	} catch {
+		/* fuera de Tauri */
+	}
+}
+
 /** Aplica el tamaño por defecto de la ventana del launcher (16:9 lo asegura Rust). */
 async function applyLauncherSize(width: number, height: number) {
 	try {
@@ -135,6 +241,7 @@ export async function refreshSettings() {
 		ui.settings = await getSettings();
 		applyTheme(ui.settings.darkMode);
 		applyLauncherSize(ui.settings.launcherWidth, ui.settings.launcherHeight);
+		applyCloseBehavior(ui.settings.closeToBackground);
 	} catch {
 		applyTheme(true);
 	}
@@ -144,6 +251,7 @@ export async function refreshSettings() {
 export function setSettings(s: AppSettingsDto) {
 	ui.settings = s;
 	applyTheme(s.darkMode);
+	applyCloseBehavior(s.closeToBackground);
 }
 
 export function clearError(id: string) {
@@ -180,6 +288,23 @@ export function setStatus(id: string, state: string) {
 
 export async function refreshInstances() {
 	ui.instances = await listInstances();
+	syncTray();
+}
+
+// Mantiene el submenú "Jugar" de la bandeja al día con las instancias.
+let lastTraySig = '';
+async function syncTray() {
+	const sig = ui.instances.map((i) => i.id + ':' + i.name).join('|');
+	if (sig === lastTraySig) return;
+	lastTraySig = sig;
+	try {
+		const { invoke } = await import('@tauri-apps/api/core');
+		await invoke('set_tray_instances', {
+			items: ui.instances.map((i) => ({ id: i.id, name: i.name }))
+		});
+	} catch {
+		/* fuera de Tauri */
+	}
 }
 
 export function appendLog(id: string, line: string) {

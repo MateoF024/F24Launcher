@@ -72,6 +72,9 @@ public final class LauncherPaths {
     /** instances-data/<id> — metadatos (instance.json, content.json) separados del juego. */
     public static Path instanceData(String id) { return ensure(instancesData().resolve(id)); }
 
+    /** instances-data/<id>/icon.png — icono personalizado de la instancia (256x256). */
+    public static Path instanceIcon(String id) { return instanceData(id).resolve("icon.png"); }
+
     /** natives/<versionKey> — natives compartidos por versión (mc + loader). */
     public static Path versionNatives(String versionKey) {
         return ensure(natives().resolve(safe(versionKey)));

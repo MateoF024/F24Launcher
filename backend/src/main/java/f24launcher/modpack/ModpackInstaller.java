@@ -43,6 +43,35 @@ public class ModpackInstaller {
                          String loader, String loaderVersion,
                          List<FileEntry> files, String overridesPrefix) {}
 
+    /** Extras propios de un .f24pack (f24launcher.json). Valores 0/"" = ausentes. */
+    public record F24Meta(String icon, int minMemoryMb, int maxMemoryMb,
+                          int windowWidth, int windowHeight, String jvmArgs, String sourceModpackId) {}
+
+    /** Lee f24launcher.json del pack si existe; null si no está. */
+    public F24Meta readF24Meta(Path packFile) {
+        try {
+            JsonObject o = readJsonFromZip(packFile, "f24launcher.json");
+            if (o == null) return null;
+            return new F24Meta(str(o, "icon"), intOr(o, "minMemoryMb"), intOr(o, "maxMemoryMb"),
+                    intOr(o, "windowWidth"), intOr(o, "windowHeight"), str(o, "jvmArgs"), str(o, "sourceModpackId"));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Lee los bytes de una entrada del pack (p. ej. el icono); null si no existe. */
+    public byte[] readEntry(Path packFile, String name) {
+        try (ZipFile zip = new ZipFile(packFile.toFile(), StandardCharsets.UTF_8)) {
+            ZipEntry e = zip.getEntry(name);
+            if (e == null) return null;
+            try (InputStream is = zip.getInputStream(e)) {
+                return is.readAllBytes();
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Descarga el archivo del modpack a un temporal y devuelve su ruta. */
     public Path download(String url, Sink sink) throws Exception {
         sink.update("Descargando modpack", 0, 1);
@@ -221,5 +250,13 @@ public class ModpackInstaller {
 
     private static String str(JsonObject o, String key) {
         return o != null && o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : "";
+    }
+
+    private static int intOr(JsonObject o, String key) {
+        try {
+            return o != null && o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsInt() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
     }
 }

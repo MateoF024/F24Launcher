@@ -35,7 +35,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Firma de código — la clave privada nunca se sube (el .cer público sí puede)
+tools/*.pfx
+*.snk
+
 # Documentación interna y notas de desarrollo (no se publican)
 /docs/
-/roadmap.md
-/GETTING_STARTED.md

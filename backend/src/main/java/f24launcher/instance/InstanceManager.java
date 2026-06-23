@@ -37,7 +37,9 @@ public class InstanceManager {
         } catch (Exception e) {
             log.warn("No se pudieron listar instancias: {}", e.getMessage());
         }
-        out.sort(Comparator.comparingLong((InstanceConfig c) -> c.lastPlayed).reversed());
+        // Favoritas primero; dentro de cada grupo, las más jugadas arriba.
+        out.sort(Comparator.comparing((InstanceConfig c) -> !c.favorite)
+                .thenComparing(Comparator.comparingLong((InstanceConfig c) -> c.lastPlayed).reversed()));
         return out;
     }
 
@@ -102,12 +104,17 @@ public class InstanceManager {
         copy.javaPathOverride = src.javaPathOverride;
         copy.installed = src.installed;
         copy.sourceModpackId = src.sourceModpackId;
+        copy.icon = src.icon;
+        copy.group = src.group;
         try {
             copyTree(LauncherPaths.instanceGameDir(id), LauncherPaths.instanceGameDir(newId));
             Path srcManifest = LauncherPaths.instanceData(id).resolve("content.json");
             if (Files.exists(srcManifest))
                 Files.copy(srcManifest, LauncherPaths.instanceData(newId).resolve("content.json"),
                         StandardCopyOption.REPLACE_EXISTING);
+            Path srcIcon = LauncherPaths.instanceIcon(id);
+            if (Files.exists(srcIcon))
+                Files.copy(srcIcon, LauncherPaths.instanceIcon(newId), StandardCopyOption.REPLACE_EXISTING);
         } catch (Exception e) {
             log.error("No se pudo duplicar {}: {}", id, e.getMessage());
             delete(newId);

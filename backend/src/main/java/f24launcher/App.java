@@ -20,6 +20,8 @@ public class App {
     // Redirige el log del backend a un archivo en el directorio de datos, antes
     // de que se inicialice cualquier logger (slf4j-simple lee esto al arrancar).
     static {
+        // Servicio sin GUI: AWT/ImageIO (normalización de iconos) en modo headless.
+        System.setProperty("java.awt.headless", "true");
         if (System.getProperty("org.slf4j.simpleLogger.logFile") == null) {
             try {
                 java.nio.file.Path dir = java.nio.file.Paths.get(

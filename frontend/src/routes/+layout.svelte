@@ -3,13 +3,174 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
-	import { ui, initStore, logout } from '$lib/store.svelte';
+	import {
+		ui,
+		initStore,
+		logout,
+		refreshInstances,
+		setProgress,
+		importDroppedFiles,
+		hasContentDrop,
+		setLaunchModeActive
+	} from '$lib/store.svelte';
+	import { importModpack, launchInstance, ipcReady } from '$lib/ipc';
 	import Icon from '$lib/Icon.svelte';
 	import { fade } from 'svelte/transition';
 
 	let { children } = $props();
 
-	onMount(initStore);
+	let dragOver = $state(false);
+	let dropText = $state('Suelta el modpack para importarlo');
+	let importMsg = $state('');
+
+	let launchModeId = $state('');
+	let launchArmed = false;
+
+	onMount(() => {
+		let unlistenDrop: (() => void) | undefined;
+		let unlistenOpen: (() => void) | undefined;
+		let unlistenLaunch: (() => void) | undefined;
+		(async () => {
+			await initStore();
+
+			// Modo "acceso directo": la ventana viene oculta; lanzamos y salimos al cerrar el juego.
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				const target = await invoke<string | null>('get_launch_target');
+				if (target) {
+					setLaunchModeActive(true);
+					startLaunchMode(target);
+				}
+			} catch {
+				/* fuera de Tauri */
+			}
+
+			try {
+				const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+				unlistenDrop = await getCurrentWebview().onDragDropEvent(async (e) => {
+					const p = e.payload;
+					if (p.type === 'enter' || p.type === 'over') {
+						dragOver = true;
+						dropText = hasContentDrop()
+							? 'Suelta los archivos para añadirlos a la instancia'
+							: 'Suelta el modpack para importarlo';
+					} else if (p.type === 'leave') {
+						dragOver = false;
+					} else if (p.type === 'drop') {
+						dragOver = false;
+						const paths = p.paths ?? [];
+						if (await importDroppedFiles(paths)) return; // mods → instancia activa
+						const pack = paths.find((x) => /\.(f24pack|mrpack|zip)$/i.test(x));
+						if (pack) importPack(pack);
+					}
+				});
+			} catch {
+				/* fuera de Tauri */
+			}
+			try {
+				const { listen } = await import('@tauri-apps/api/event');
+				unlistenOpen = await listen<string>('open-f24pack', (e) => {
+					if (e.payload) importPack(e.payload);
+				});
+				unlistenLaunch = await listen<string>('launch-instance', (e) => {
+					if (e.payload) launchForwarded(e.payload);
+				});
+				const { invoke } = await import('@tauri-apps/api/core');
+				const pending = await invoke<string | null>('take_pending_open');
+				if (pending) importPack(pending);
+			} catch {
+				/* fuera de Tauri */
+			}
+		})();
+		return () => {
+			unlistenDrop?.();
+			unlistenOpen?.();
+			unlistenLaunch?.();
+		};
+	});
+
+	// Modo lanzar: al terminar el juego (sin instancias en ejecución) cierra la app;
+	// si falla la cuenta/lanzamiento, abre la ventana en /accounts con un mensaje.
+	$effect(() => {
+		if (!launchModeId) return;
+		const st = ui.status[launchModeId];
+		if (st === 'error') {
+			launchFallback(ui.errors[launchModeId] || 'No se pudo lanzar la instancia.');
+			return;
+		}
+		const anyRunning = Object.values(ui.status).some((s) => s === 'running');
+		if (anyRunning) launchArmed = true;
+		else if (launchArmed) exitApp();
+	});
+
+	/** Arranque en frío desde un acceso directo: lanza y deja la app para salir al terminar. */
+	async function startLaunchMode(id: string) {
+		launchModeId = id;
+		await ipcReady;
+		const active = ui.accounts.find((a) => a.active);
+		if (!active) {
+			launchFallback('Inicia sesión para jugar esta instancia.');
+			return;
+		}
+		try {
+			await launchInstance(id, active.username);
+		} catch (e) {
+			launchFallback('No se pudo lanzar: ' + (e as Error).message);
+		}
+	}
+
+	/** Acceso directo con la app ya abierta: solo lanza (no cierra la app al terminar). */
+	async function launchForwarded(id: string) {
+		const active = ui.accounts.find((a) => a.active);
+		if (!active) {
+			goto('/accounts');
+			return;
+		}
+		try {
+			await launchInstance(id, active.username);
+			goto('/');
+		} catch {
+			/* la tarjeta de la instancia mostrará el error */
+		}
+	}
+
+	async function launchFallback(msg: string) {
+		launchModeId = '';
+		setLaunchModeActive(false);
+		try {
+			const { invoke } = await import('@tauri-apps/api/core');
+			await invoke('show_window');
+		} catch {
+			/* fuera de Tauri */
+		}
+		importMsg = msg;
+		setTimeout(() => (importMsg = ''), 6000);
+		goto('/accounts');
+	}
+
+	async function exitApp() {
+		try {
+			const { invoke } = await import('@tauri-apps/api/core');
+			await invoke('exit_app');
+		} catch {
+			/* fuera de Tauri */
+		}
+	}
+
+	async function importPack(path: string) {
+		importMsg = 'Importando modpack…';
+		try {
+			await ipcReady;
+			const inst = await importModpack(path);
+			setProgress(inst.id, { phase: 'Importando', done: 0, total: 1 });
+			await refreshInstances();
+			importMsg = '';
+			goto('/');
+		} catch (e) {
+			importMsg = 'No se pudo importar: ' + (e as Error).message;
+			setTimeout(() => (importMsg = ''), 4500);
+		}
+	}
 
 	const path = $derived($page.url.pathname);
 
@@ -83,6 +244,15 @@
 		{/key}
 	</main>
 </div>
+
+{#if dragOver}
+	<div class="dropzone" transition:fade={{ duration: 120 }}>
+		<div class="dropmsg"><Icon name="download" size={30} />{dropText}</div>
+	</div>
+{/if}
+{#if importMsg}
+	<div class="toast" transition:fade={{ duration: 120 }}>{importMsg}</div>
+{/if}
 
 <style>
 	.app {
@@ -245,5 +415,42 @@
 	main {
 		overflow: auto;
 		padding: 28px 32px;
+	}
+	.dropzone {
+		position: fixed;
+		inset: 0;
+		z-index: 100;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(0, 0, 0, 0.55);
+		backdrop-filter: blur(2px);
+		pointer-events: none;
+	}
+	.dropmsg {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 22px 30px;
+		border: 2px dashed var(--accent);
+		border-radius: 16px;
+		background: var(--bg-elev);
+		color: var(--text);
+		font-weight: 600;
+		font-size: 15px;
+	}
+	.toast {
+		position: fixed;
+		bottom: 22px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 101;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		padding: 11px 18px;
+		font-size: 13px;
+		color: var(--text);
+		box-shadow: 0 10px 26px rgba(0, 0, 0, 0.4);
 	}
 </style>

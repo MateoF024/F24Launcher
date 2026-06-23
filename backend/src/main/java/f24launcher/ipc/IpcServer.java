@@ -15,8 +15,10 @@ import f24launcher.core.meta.MojangMeta;
 import f24launcher.core.meta.MojangMeta.VersionDetails;
 import f24launcher.core.runtime.JavaRuntimeManager;
 import f24launcher.core.version.VanillaInstaller;
+import f24launcher.instance.IconStore;
 import f24launcher.instance.InstanceConfig;
 import f24launcher.instance.InstanceManager;
+import f24launcher.modpack.ModpackExporter;
 import f24launcher.modpack.ModpackInstaller;
 import f24launcher.modpack.ModpackService;
 import f24launcher.settings.AppSettings;
@@ -33,6 +35,8 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 
 /**
@@ -76,6 +80,13 @@ public class IpcServer {
                 }
                 return;
             }
+            // Recursos servidos directamente a <img> (no pueden enviar cabecera): token por query-param.
+            if (ctx.method() == HandlerType.GET && ctx.path().endsWith("/icon")) {
+                if (!token.equals(ctx.queryParam("token"))) {
+                    throw new UnauthorizedResponse("token inválido o ausente");
+                }
+                return;
+            }
             String provided = ctx.header(TOKEN_HEADER);
             if (provided == null || !provided.equals(token)) {
                 throw new UnauthorizedResponse("token inválido o ausente");
@@ -113,6 +124,9 @@ public class IpcServer {
             if (req.fullscreen != null) cfg.fullscreen = req.fullscreen;
             if (req.jvmArgs != null) cfg.jvmArgs = req.jvmArgs.trim();
             if (req.javaPathOverride != null) cfg.javaPathOverride = req.javaPathOverride.trim();
+            if (req.iconData != null && !req.iconData.isBlank() && IconStore.save(cfg.id, req.iconData)) {
+                cfg.icon = "icon.png";
+            }
             instanceManager.save(cfg);
             json(ctx, cfg);
         });
@@ -132,6 +146,13 @@ public class IpcServer {
                 if (r.fullscreen != null) cfg.fullscreen = r.fullscreen;
                 if (r.jvmArgs != null) cfg.jvmArgs = r.jvmArgs.trim();
                 if (r.javaPathOverride != null) cfg.javaPathOverride = r.javaPathOverride.trim();
+                // iconData: null = sin cambios · "" = quitar · base64 = establecer.
+                if (r.iconData != null) {
+                    if (r.iconData.isBlank()) { IconStore.delete(cfg.id); cfg.icon = ""; }
+                    else if (IconStore.save(cfg.id, r.iconData)) cfg.icon = "icon.png";
+                }
+                if (r.favorite != null) cfg.favorite = r.favorite;
+                if (r.group != null) cfg.group = r.group.trim();
             }
             instanceManager.save(cfg);
             json(ctx, cfg);
@@ -220,6 +241,52 @@ public class IpcServer {
                 log.warn("No se pudo abrir la carpeta de {}: {}", id, e.getMessage());
                 ctx.status(500).result("No se pudo abrir la carpeta");
             }
+        });
+
+        // Sirve el icono PNG de la instancia (a <img>; token por query-param).
+        app.get("/instances/{id}/icon", ctx -> {
+            Path icon = LauncherPaths.instanceIcon(ctx.pathParam("id"));
+            if (!Files.exists(icon)) { ctx.status(404); return; }
+            ctx.contentType("image/png").header("Cache-Control", "no-cache");
+            ctx.result(Files.readAllBytes(icon));
+        });
+
+        // Quita el icono personalizado (vuelve al placeholder).
+        app.delete("/instances/{id}/icon", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            IconStore.delete(cfg.id);
+            cfg.icon = "";
+            instanceManager.save(cfg);
+            ctx.status(204);
+        });
+
+        // Lista carpetas/archivos de la instancia (para el selector de exportación). path relativo opcional.
+        app.get("/instances/{id}/files", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            Path base = LauncherPaths.instanceGameDir(cfg.id);
+            String rel = ctx.queryParam("path");
+            Path dir = (rel == null || rel.isBlank()) ? base : base.resolve(rel).normalize();
+            if (!dir.startsWith(base) || !Files.isDirectory(dir)) { json(ctx, List.of()); return; }
+            List<Map<String, Object>> out = new ArrayList<>();
+            try (var s = Files.list(dir)) {
+                var sorted = s.sorted(Comparator
+                        .comparing((Path p) -> !Files.isDirectory(p))
+                        .thenComparing(p -> p.getFileName().toString().toLowerCase())).toList();
+                for (Path p : sorted) {
+                    boolean d = Files.isDirectory(p);
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", p.getFileName().toString());
+                    m.put("path", base.relativize(p).toString().replace('\\', '/'));
+                    m.put("dir", d);
+                    m.put("size", d ? 0L : Files.size(p));
+                    out.add(m);
+                }
+            } catch (Exception e) {
+                log.debug("listar archivos {}: {}", cfg.id, e.getMessage());
+            }
+            json(ctx, out);
         });
 
         // ── Ajustes globales ──
@@ -425,6 +492,65 @@ public class IpcServer {
             }
         });
 
+        // Informe de compatibilidad del contenido frente a una versión/loader objetivo (preview).
+        app.get("/instances/{id}/content/compat", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            String mc = qp(ctx, "mc", cfg.mcVersion);
+            String loader = qp(ctx, "loader", cfg.loader);
+            try {
+                json(ctx, contentInstaller.compat(cfg, mc, loader));
+            } catch (Exception e) {
+                ctx.status(502).result(e.getMessage());
+            }
+        });
+
+        // Cambia la versión de MC / loader de la instancia y la reinstala (async, progreso por WS).
+        app.post("/instances/{id}/change-version", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (gameLauncher.isRunning(cfg.id)) {
+                ctx.status(409).result("detén la instancia antes de cambiar la versión");
+                return;
+            }
+            ChangeVersionReq req = gson.fromJson(ctx.body(), ChangeVersionReq.class);
+            if (req == null || req.mcVersion == null || req.mcVersion.isBlank()) {
+                ctx.status(400).result("mcVersion requerido");
+                return;
+            }
+            String loader = (req.loader == null || req.loader.isBlank()) ? "vanilla" : req.loader.trim();
+            String lv = req.loaderVersion == null ? "" : req.loaderVersion.trim();
+            if (!"vanilla".equals(loader) && lv.isBlank()) {
+                ctx.status(400).result("loaderVersion requerido");
+                return;
+            }
+            cfg.mcVersion = req.mcVersion.trim();
+            cfg.loader = loader;
+            cfg.loaderVersion = "vanilla".equals(loader) ? "" : lv;
+            cfg.installed = false;
+            instanceManager.save(cfg);
+            AppExecutors.io().submit(() -> runInstall(cfg));
+            json(ctx, cfg);
+        });
+
+        // Verifica y repara el contenido (hashes) — re-descarga lo que falte o esté corrupto.
+        app.post("/instances/{id}/repair", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            AppExecutors.io().submit(() -> {
+                try {
+                    eventBus.publish("state", stateEvent(cfg.id, "installing", null));
+                    contentInstaller.repair(cfg, (phase, d, t) ->
+                            eventBus.publish("progress", progressEvent(cfg.id, phase, d, t)));
+                    eventBus.publish("state", stateEvent(cfg.id, "installed", null));
+                } catch (Exception e) {
+                    log.error("Error reparando {}: {}", cfg.id, e.getMessage(), e);
+                    eventBus.publish("state", stateEvent(cfg.id, "error", e.getMessage()));
+                }
+            });
+            ctx.status(202);
+        });
+
         app.post("/instances/{id}/content/install", ctx -> {
             InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
@@ -458,6 +584,22 @@ public class IpcServer {
             try {
                 boolean ok = contentInstaller.remove(cfg, req.type, req.fileName);
                 ctx.status(ok ? 204 : 404);
+            } catch (Exception e) {
+                ctx.status(502).result(e.getMessage());
+            }
+        });
+
+        // Importa archivos sueltos (.jar/.zip) arrastrados a la instancia → carpeta correcta + identify.
+        app.post("/instances/{id}/content/import-file", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            ImportFilesReq req = gson.fromJson(ctx.body(), ImportFilesReq.class);
+            if (req == null || req.filePaths == null || req.filePaths.isEmpty()) {
+                ctx.status(400).result("filePaths requerido");
+                return;
+            }
+            try {
+                json(ctx, contentInstaller.importFiles(cfg, req.filePaths, req.type));
             } catch (Exception e) {
                 ctx.status(502).result(e.getMessage());
             }
@@ -516,6 +658,62 @@ public class IpcServer {
             } catch (Exception e) {
                 log.error("Error preparando modpack: {}", e.getMessage(), e);
                 try { if (packFile != null) Files.deleteIfExists(packFile); } catch (Exception ignored) {}
+                ctx.status(502).result(e.getMessage());
+            }
+        });
+
+        // Importa un modpack desde un archivo local (.f24pack/.mrpack/.zip) → instancia nueva (async).
+        app.post("/modpacks/import", ctx -> {
+            ImportReq req = gson.fromJson(ctx.body(), ImportReq.class);
+            if (req == null || req.filePath == null || req.filePath.isBlank()) {
+                ctx.status(400).result("filePath requerido");
+                return;
+            }
+            Path source = Paths.get(req.filePath);
+            if (!Files.isRegularFile(source)) { ctx.status(400).result("archivo no encontrado"); return; }
+            Path packFile = null;
+            try {
+                // Copia a un temporal: runModpackInstall borra el pack al terminar y no
+                // queremos borrar el archivo original del usuario.
+                String ext = req.filePath.toLowerCase(Locale.ROOT).endsWith(".mrpack") ? ".mrpack" : ".zip";
+                packFile = Files.createTempFile("f24-import-", ext);
+                Files.copy(source, packFile, StandardCopyOption.REPLACE_EXISTING);
+                ModpackInstaller.Parsed parsed = modpackInstaller.parse(packFile);
+                String mc = nz(parsed.mcVersion());
+                if (mc.isBlank()) {
+                    Files.deleteIfExists(packFile);
+                    ctx.status(400).result("No se pudo determinar la versión de Minecraft del modpack");
+                    return;
+                }
+                String name = (parsed.name() != null && !parsed.name().isBlank())
+                        ? parsed.name() : fileBaseName(source);
+                InstanceConfig cfg = instanceManager.create(name, mc, parsed.loader(), parsed.loaderVersion());
+                applyF24Meta(cfg, packFile);
+                instanceManager.save(cfg);
+                final Path pf = packFile;
+                AppExecutors.io().submit(() -> runModpackInstall(cfg, pf, parsed));
+                json(ctx, cfg);
+            } catch (Exception e) {
+                log.error("Error importando modpack: {}", e.getMessage(), e);
+                try { if (packFile != null) Files.deleteIfExists(packFile); } catch (Exception ignored) {}
+                ctx.status(502).result(e.getMessage());
+            }
+        });
+
+        // Exporta una instancia a .f24pack / .mrpack en la ruta elegida por el usuario.
+        app.post("/instances/{id}/export", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            ModpackExporter.Options opt = gson.fromJson(ctx.body(), ModpackExporter.Options.class);
+            if (opt == null || opt.outputPath == null || opt.outputPath.isBlank()) {
+                ctx.status(400).result("outputPath requerido");
+                return;
+            }
+            try {
+                new ModpackExporter().export(cfg, opt);
+                ctx.status(204);
+            } catch (Exception e) {
+                log.error("Error exportando {}: {}", cfg.id, e.getMessage(), e);
                 ctx.status(502).result(e.getMessage());
             }
         });
@@ -632,6 +830,8 @@ public class IpcServer {
         m.put("defaultJvmArgs", s.getDefaultJvmArgs());
         m.put("launcherWidth", s.getLauncherWidth());
         m.put("launcherHeight", s.getLauncherHeight());
+        m.put("closeToBackground", s.isCloseToBackground());
+        m.put("minimizeOnLaunch", s.isMinimizeOnLaunch());
         return m;
     }
 
@@ -687,6 +887,35 @@ public class IpcServer {
 
     private static String nz(String s) { return s == null ? "" : s; }
 
+    /** Aplica los extras de un .f24pack (icono, memoria, jvm, ventana) a la instancia creada. */
+    private void applyF24Meta(InstanceConfig cfg, Path packFile) {
+        try {
+            ModpackInstaller.F24Meta meta = modpackInstaller.readF24Meta(packFile);
+            String iconName = "icon.png";
+            if (meta != null) {
+                if (meta.minMemoryMb() > 0) cfg.minMemoryMb = clamp(meta.minMemoryMb(), 256, 65536);
+                if (meta.maxMemoryMb() > 0) cfg.maxMemoryMb = clamp(meta.maxMemoryMb(), 512, 65536);
+                if (cfg.maxMemoryMb < cfg.minMemoryMb) cfg.maxMemoryMb = cfg.minMemoryMb;
+                if (meta.windowWidth() > 0) cfg.windowWidth = Math.max(640, meta.windowWidth());
+                if (meta.windowHeight() > 0) cfg.windowHeight = Math.max(480, meta.windowHeight());
+                if (meta.jvmArgs() != null && !meta.jvmArgs().isBlank()) cfg.jvmArgs = meta.jvmArgs().trim();
+                if (meta.sourceModpackId() != null && !meta.sourceModpackId().isBlank())
+                    cfg.sourceModpackId = meta.sourceModpackId();
+                if (meta.icon() != null && !meta.icon().isBlank()) iconName = meta.icon();
+            }
+            byte[] icon = modpackInstaller.readEntry(packFile, iconName);
+            if (icon != null && IconStore.saveBytes(cfg.id, icon)) cfg.icon = "icon.png";
+        } catch (Exception e) {
+            log.debug("f24 meta import: {}", e.getMessage());
+        }
+    }
+
+    private static String fileBaseName(Path p) {
+        String n = p.getFileName().toString();
+        int dot = n.lastIndexOf('.');
+        return dot > 0 ? n.substring(0, dot) : n;
+    }
+
     private static int clamp(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
 
     public String getToken() { return token; }
@@ -702,16 +931,20 @@ public class IpcServer {
     private record CreateReq(String name, String mcVersion, String loader, String loaderVersion,
                              Integer minMemoryMb, Integer maxMemoryMb, Integer windowWidth,
                              Integer windowHeight, Boolean fullscreen, String jvmArgs,
-                             String javaPathOverride) {}
+                             String javaPathOverride, String iconData) {}
     private record LaunchReq(String username) {}
     private record OfflineReq(String username) {}
     private record InstallReq(String source, String type, String projectId, String versionId, boolean ignore) {}
+    private record ChangeVersionReq(String mcVersion, String loader, String loaderVersion) {}
     private record FileReq(String type, String fileName) {}
+    private record ImportFilesReq(List<String> filePaths, String type) {}
     private record ModpackInstallReq(String id, String name, String downloadUrl,
                                      String mcVersion, String loader, String loaderVersion) {}
+    private record ImportReq(String filePath) {}
     private record UpdateReq(String name, Integer minMemoryMb, Integer maxMemoryMb,
                              Integer windowWidth, Integer windowHeight, Boolean fullscreen,
-                             String jvmArgs, String javaPathOverride) {}
+                             String jvmArgs, String javaPathOverride, String iconData,
+                             Boolean favorite, String group) {}
     private record SkinReq(String url, String variant) {}
     private record SkinUploadReq(String data, String fileName, String variant) {}
     private record CapeReq(String capeId) {}

@@ -38,6 +38,10 @@ public class AppSettings {
     @Expose private int launcherWidth = 1440;
     @Expose private int launcherHeight = 810;
 
+    // Comportamiento de ventana.
+    @Expose private boolean closeToBackground = false;  // cerrar (X) oculta a la bandeja en vez de salir
+    @Expose private boolean minimizeOnLaunch = false;   // minimizar al lanzar una instancia; restaurar al terminar
+
     private AppSettings() {}
 
     public static synchronized AppSettings getInstance() {
@@ -103,6 +107,8 @@ public class AppSettings {
         if (p.defaultJvmArgs != null) defaultJvmArgs = p.defaultJvmArgs.trim();
         if (p.launcherWidth != null) launcherWidth = clamp(p.launcherWidth, 1024, 3840);
         if (p.launcherHeight != null) launcherHeight = clamp(p.launcherHeight, 576, 2160);
+        if (p.closeToBackground != null) closeToBackground = p.closeToBackground;
+        if (p.minimizeOnLaunch != null) minimizeOnLaunch = p.minimizeOnLaunch;
         save();
     }
 
@@ -118,6 +124,8 @@ public class AppSettings {
         public String defaultJvmArgs;
         public Integer launcherWidth;
         public Integer launcherHeight;
+        public Boolean closeToBackground;
+        public Boolean minimizeOnLaunch;
     }
 
     private static int clamp(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
@@ -133,4 +141,6 @@ public class AppSettings {
     public String getDefaultJvmArgs() { return defaultJvmArgs == null ? "" : defaultJvmArgs; }
     public int getLauncherWidth() { return launcherWidth; }
     public int getLauncherHeight() { return launcherHeight; }
+    public boolean isCloseToBackground() { return closeToBackground; }
+    public boolean isMinimizeOnLaunch() { return minimizeOnLaunch; }
 }

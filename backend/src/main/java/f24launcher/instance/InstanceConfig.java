@@ -21,6 +21,9 @@ public class InstanceConfig {
     @Expose public long lastPlayed = 0;
     @Expose public long totalPlayMs = 0;
     @Expose public String sourceModpackId = "";        // id del modpack si vino de uno
+    @Expose public String icon = "";                     // "icon.png" si hay icono personalizado; vacío = placeholder
+    @Expose public boolean favorite = false;             // fijada (se ordena primero)
+    @Expose public String group = "";                    // grupo/etiqueta para organizar el grid
     @Expose public boolean installed = false;            // true cuando la versión/loader ya está descargado
 
     public InstanceConfig() {}

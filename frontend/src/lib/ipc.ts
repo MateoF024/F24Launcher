@@ -110,6 +110,9 @@ export interface Instance {
 	installed: boolean;
 	lastPlayed: number;
 	sourceModpackId: string;
+	icon: string;
+	favorite: boolean;
+	group: string;
 }
 
 export interface VanillaVersion {
@@ -260,6 +263,27 @@ export const listInstalledContent = (instanceId: string) =>
 export const getContentUpdates = (instanceId: string) =>
 	api<UpdateInfo[]>(`/instances/${instanceId}/content/updates`);
 
+export interface CompatItem {
+	fileName: string;
+	type: ContentType;
+	name: string;
+	status: 'compatible' | 'updatable' | 'incompatible' | 'unknown';
+	versionId: string;
+	versionName: string;
+}
+
+/** Informe de compatibilidad del contenido frente a una versión/loader objetivo (preview). */
+export const getContentCompat = (instanceId: string, mc: string, loader: string) =>
+	api<CompatItem[]>(
+		`/instances/${instanceId}/content/compat?mc=${encodeURIComponent(mc)}&loader=${encodeURIComponent(loader)}`
+	);
+
+/** Cambia versión de MC / loader y reinstala (progreso por WS). Devuelve la instancia actualizada. */
+export const changeInstanceVersion = (
+	id: string,
+	body: { mcVersion: string; loader: string; loaderVersion: string }
+) => api<Instance>(`/instances/${id}/change-version`, { method: 'POST', body: JSON.stringify(body) });
+
 /** Identifica mods añadidos manualmente (hash Modrinth / nombre CurseForge). */
 export const identifyContent = (instanceId: string) =>
 	api<InstalledItem[]>(`/instances/${instanceId}/content/identify`, { method: 'POST' });
@@ -279,6 +303,13 @@ export const removeContent = (instanceId: string, type: ContentType, fileName: s
 	api<void>(`/instances/${instanceId}/content/remove`, {
 		method: 'POST',
 		body: JSON.stringify({ type, fileName })
+	});
+
+/** Importa archivos sueltos (.jar/.zip) arrastrados a la instancia. type opcional = carpeta forzada. */
+export const importContentFiles = (instanceId: string, filePaths: string[], type?: string) =>
+	api<InstalledItem[]>(`/instances/${instanceId}/content/import-file`, {
+		method: 'POST',
+		body: JSON.stringify({ filePaths, type: type || undefined })
 	});
 
 export const getInstance = (id: string) => api<Instance>(`/instances/${id}`);
@@ -319,6 +350,42 @@ export const installModpack = (body: {
 	loaderVersion?: string;
 }) => api<Instance>('/modpacks/install', { method: 'POST', body: JSON.stringify(body) });
 
+/** Importa un modpack desde un archivo local (.f24pack/.mrpack/.zip) → instancia nueva. */
+export const importModpack = (filePath: string) =>
+	api<Instance>('/modpacks/import', { method: 'POST', body: JSON.stringify({ filePath }) });
+
+export interface ExportOptions {
+	outputPath: string;
+	name?: string;
+	minMemoryMb?: number;
+	maxMemoryMb?: number;
+	windowWidth?: number;
+	windowHeight?: number;
+	jvmArgs?: string;
+	includePaths?: string[];
+	includeIcon?: boolean;
+	format?: 'f24pack' | 'mrpack';
+}
+
+/** Exporta una instancia a un archivo .f24pack/.mrpack en la ruta indicada. */
+export const exportInstance = (id: string, opt: ExportOptions) =>
+	api<void>(`/instances/${id}/export`, { method: 'POST', body: JSON.stringify(opt) });
+
+export interface FileEntry {
+	name: string;
+	path: string;
+	dir: boolean;
+	size: number;
+}
+
+/** Lista carpetas/archivos de la instancia bajo `path` (relativo; vacío = raíz). */
+export const listInstanceFiles = (id: string, path = '') =>
+	api<FileEntry[]>(`/instances/${id}/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+
+/** Verifica y repara el contenido de la instancia (re-descarga lo corrupto/faltante). */
+export const repairInstance = (id: string) =>
+	api<void>(`/instances/${id}/repair`, { method: 'POST' });
+
 export const listInstances = () => api<Instance[]>('/instances');
 export const listVersions = () => api<VanillaVersion[]>('/versions/vanilla');
 export const listLoaderVersions = (type: string, mc: string) =>
@@ -336,6 +403,8 @@ export const createInstance = (body: {
 	fullscreen?: boolean;
 	jvmArgs?: string;
 	javaPathOverride?: string;
+	/** PNG en data-URL/base64; el backend lo normaliza a 256×256. */
+	iconData?: string;
 }) => api<Instance>('/instances', { method: 'POST', body: JSON.stringify(body) });
 
 export interface InstanceSettings {
@@ -347,10 +416,21 @@ export interface InstanceSettings {
 	fullscreen?: boolean;
 	jvmArgs?: string;
 	javaPathOverride?: string;
+	/** PNG en data-URL/base64 = establecer · "" = quitar · ausente = sin cambios. */
+	iconData?: string;
+	favorite?: boolean;
+	group?: string;
 }
 
 export const updateInstance = (id: string, body: InstanceSettings) =>
 	api<Instance>(`/instances/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+
+/** URL del icono de la instancia para usar en <img> (token por query-param). */
+export const instanceIconUrl = (id: string, bust = 0) =>
+	`${base()}/instances/${id}/icon?token=${encodeURIComponent(TOKEN)}&t=${bust}`;
+
+export const deleteInstanceIcon = (id: string) =>
+	api<void>(`/instances/${id}/icon`, { method: 'DELETE' });
 
 export const installInstance = (id: string) =>
 	api<void>(`/instances/${id}/install`, { method: 'POST' });
@@ -385,6 +465,8 @@ export interface AppSettingsDto {
 	defaultJvmArgs: string;
 	launcherWidth: number;
 	launcherHeight: number;
+	closeToBackground: boolean;
+	minimizeOnLaunch: boolean;
 }
 export const getSettings = () => api<AppSettingsDto>('/settings');
 export const updateSettings = (body: Partial<AppSettingsDto>) =>
