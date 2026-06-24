@@ -14,6 +14,7 @@
 		setLaunchModeActive
 	} from '$lib/store.svelte';
 	import { importModpack, launchInstance, ipcReady } from '$lib/ipc';
+	import { initClientLog } from '$lib/clientLog';
 	import Icon from '$lib/Icon.svelte';
 	import { fade } from 'svelte/transition';
 
@@ -27,6 +28,7 @@
 	let launchArmed = false;
 
 	onMount(() => {
+		initClientLog(); // captura consola/errores del webview → logs/frontend-latest.log
 		let unlistenDrop: (() => void) | undefined;
 		let unlistenOpen: (() => void) | undefined;
 		let unlistenLaunch: (() => void) | undefined;

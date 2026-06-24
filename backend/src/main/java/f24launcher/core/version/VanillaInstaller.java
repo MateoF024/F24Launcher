@@ -3,7 +3,7 @@ package f24launcher.core.version;
 import f24launcher.core.LauncherPaths;
 import f24launcher.core.meta.MojangMeta;
 import f24launcher.core.meta.MojangMeta.*;
-import f24launcher.util.AppExecutors;
+import f24launcher.util.DownloadManager;
 import f24launcher.util.HttpConnectionPool;
 
 import com.google.gson.Gson;
@@ -14,19 +14,19 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Descarga e instala versiones vanilla de Minecraft a la caché compartida
- * (versions/, libraries/, assets/). Verifica por tamaño y descarga en paralelo.
- * La extracción de natives y el lanzamiento se hacen en el motor de lanzamiento.
+ * (versions/, libraries/, assets/). Las descargas pasan por el {@link DownloadManager}
+ * (paralelas, escritura atómica, idempotentes). La extracción de natives y el
+ * lanzamiento se hacen en el motor de lanzamiento.
  */
 public class VanillaInstaller {
 
     private static final Logger log = LoggerFactory.getLogger(VanillaInstaller.class);
     private final Gson gson = new Gson();
     private final HttpConnectionPool http = HttpConnectionPool.getInstance();
+    private final DownloadManager dm = DownloadManager.getInstance();
 
     /** Callback de progreso: fase, completados, total. */
     public interface Sink {
@@ -62,22 +62,26 @@ public class VanillaInstaller {
         // 1) client.jar
         sink.update("Cliente", 0, 1);
         if (v.downloads != null && v.downloads.client != null) {
-            downloadFile(v.downloads.client.url, LauncherPaths.versionJar(mcVersion), v.downloads.client.size);
+            Artifact c = v.downloads.client;
+            DownloadManager.Result r = dm.download(
+                    new DownloadManager.Task(c.url, LauncherPaths.versionJar(mcVersion), c.size, c.sha1, null), false);
+            if (r.status() == DownloadManager.Status.FAILED)
+                throw new IOException("No se pudo descargar el cliente", r.error());
         }
         sink.update("Cliente", 1, 1);
 
         // 2) Librerías aplicables (Windows)
-        List<DownloadTask> libTasks = new ArrayList<>();
+        List<DownloadManager.Task> libTasks = new ArrayList<>();
         for (Library lib : v.libraries) {
             if (!LibraryRules.usableOnWindows(lib)) continue;
             if (lib.downloads != null && lib.downloads.artifact != null && lib.downloads.artifact.path != null) {
                 Artifact a = lib.downloads.artifact;
-                libTasks.add(new DownloadTask(a.url, LauncherPaths.library(a.path), a.size));
+                libTasks.add(new DownloadManager.Task(a.url, LauncherPaths.library(a.path), a.size, a.sha1, null));
             }
             // Natives clásicos (<1.19): clasificador por SO
             Artifact nat = LibraryRules.classicNativeArtifact(lib);
             if (nat != null && nat.path != null) {
-                libTasks.add(new DownloadTask(nat.url, LauncherPaths.library(nat.path), nat.size));
+                libTasks.add(new DownloadManager.Task(nat.url, LauncherPaths.library(nat.path), nat.size, nat.sha1, null));
             }
         }
         runParallel("Librerías", libTasks, sink);
@@ -93,12 +97,14 @@ public class VanillaInstaller {
                 Files.writeString(idxFile, idxJson);
             }
             AssetIndexFile idx = gson.fromJson(idxJson, AssetIndexFile.class);
-            List<DownloadTask> assetTasks = new ArrayList<>();
+            List<DownloadManager.Task> assetTasks = new ArrayList<>();
             if (idx != null && idx.objects != null) {
                 for (AssetObject obj : idx.objects.values()) {
                     String sub = obj.hash.substring(0, 2);
                     Path dest = LauncherPaths.assetObjects().resolve(sub).resolve(obj.hash);
-                    assetTasks.add(new DownloadTask(MojangMeta.RESOURCES_URL + sub + "/" + obj.hash, dest, obj.size));
+                    // El nombre del objeto ES su sha1 → lo usamos para verificar integridad.
+                    assetTasks.add(new DownloadManager.Task(
+                            MojangMeta.RESOURCES_URL + sub + "/" + obj.hash, dest, obj.size, obj.hash, null));
                 }
             }
             runParallel("Assets", assetTasks, sink);
@@ -107,36 +113,14 @@ public class VanillaInstaller {
         log.info("Versión vanilla {} instalada.", mcVersion);
     }
 
-    private void runParallel(String phase, List<DownloadTask> tasks, Sink sink) throws Exception {
+    /** Descarga un lote por el {@link DownloadManager} y aborta si alguna falla. */
+    private void runParallel(String phase, List<DownloadManager.Task> tasks, Sink sink) throws Exception {
         long total = tasks.size();
         sink.update(phase, 0, total);
         if (total == 0) return;
-        AtomicLong done = new AtomicLong();
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (DownloadTask t : tasks) {
-            futures.add(CompletableFuture.runAsync(() -> {
-                try {
-                    downloadFile(t.url, t.dest, t.size);
-                } catch (Exception e) {
-                    throw new RuntimeException("Fallo descargando " + t.url + ": " + e.getMessage(), e);
-                }
-                long d = done.incrementAndGet();
-                if (d % 25 == 0 || d == total) sink.update(phase, d, total);
-            }, AppExecutors.download()));
-        }
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        List<DownloadManager.Result> results =
+                dm.downloadAll(tasks, (done, tot) -> sink.update(phase, done, tot), false);
+        DownloadManager.requireAllOk(results);
         sink.update(phase, total, total);
     }
-
-    /** Descarga si falta o el tamaño no coincide. */
-    private void downloadFile(String url, Path dest, long expectedSize) throws IOException {
-        if (Files.exists(dest)) {
-            if (expectedSize <= 0 || Files.size(dest) == expectedSize) return;
-        }
-        byte[] data = http.getBytes(url);
-        Files.createDirectories(dest.getParent());
-        Files.write(dest, data);
-    }
-
-    private record DownloadTask(String url, Path dest, long size) {}
 }

@@ -74,4 +74,16 @@ tasks.register('jlinkRuntime', Exec) {
         '--no-header-files',
         '--compress=zip-9',
         '--output', runtimeDir.absolutePath
+
+    // jlink no incluye el archivo CDS base (lib/server/classes.jsa). Sin él, el
+    // AppCDS del backend (-XX:+AutoCreateSharedArchive) no funciona. Lo generamos
+    // con -Xshare:dump sobre el runtime recién creado.
+    doLast {
+        def javaExe = new File(runtimeDir, isWin ? 'bin/java.exe' : 'bin/java')
+        def proc = new ProcessBuilder(javaExe.absolutePath, '-Xshare:dump')
+                .redirectErrorStream(true).start()
+        def out = proc.inputStream.text
+        if (proc.waitFor() != 0) throw new GradleException("Falló -Xshare:dump:\n${out}")
+        println "Archivo CDS base generado en el runtime jlink."
+    }
 }

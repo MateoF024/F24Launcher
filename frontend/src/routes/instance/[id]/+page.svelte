@@ -14,6 +14,7 @@
 		installContent,
 		launchInstance,
 		stopInstance,
+		cancelInstall,
 		updateInstance,
 		duplicateInstance,
 		openInstanceFolder,
@@ -239,6 +240,15 @@
 		}
 	}
 
+	async function cancel() {
+		if (!inst) return;
+		try {
+			await cancelInstall(inst.id);
+		} catch {
+			/* puede haber terminado ya */
+		}
+	}
+
 	// ── Ajustes de la instancia ──
 	let showSettings = $state(false);
 	let savingSettings = $state(false);
@@ -253,7 +263,8 @@
 		windowHeight: 720,
 		fullscreen: false,
 		jvmArgs: '',
-		javaPathOverride: ''
+		javaPathOverride: '',
+		useAikarFlags: true
 	});
 
 	// ── Cambio de versión / loader de la instancia ──
@@ -309,7 +320,8 @@
 			windowHeight: inst.windowHeight,
 			fullscreen: inst.fullscreen,
 			jvmArgs: inst.jvmArgs ?? '',
-			javaPathOverride: inst.javaPathOverride ?? ''
+			javaPathOverride: inst.javaPathOverride ?? '',
+			useAikarFlags: inst.useAikarFlags ?? true
 		};
 		editIcon = null;
 		verForm = { mcVersion: inst.mcVersion, loader: inst.loader, loaderVersion: inst.loaderVersion ?? '' };
@@ -652,7 +664,12 @@
 	{#if inst && ui.progress[inst.id]}
 		<div class="hprog" title={ui.progress[inst.id].phase}>
 			<div class="hbar"><div class="hfill" style="width:{pct(ui.progress[inst.id])}%"></div></div>
-			<span class="dim small">{ui.progress[inst.id].phase} · {pct(ui.progress[inst.id])}%</span>
+			<div class="hprow">
+				<span class="dim small">{ui.progress[inst.id].phase} · {pct(ui.progress[inst.id])}%</span>
+				<button class="hcancel" title="Cancelar instalación" onclick={cancel}>
+					<Icon name="close" size={12} />Cancelar
+				</button>
+			</div>
 		</div>
 	{:else if runState === 'running'}
 		<button class="stop" onclick={stop}><Icon name="stop" size={13} />Detener</button>
@@ -894,8 +911,13 @@
 					<input type="number" min="480" step="1" bind:value={form.windowHeight} disabled={form.fullscreen} />
 				</label>
 
+				<label class="full chk">
+					<input type="checkbox" bind:checked={form.useAikarFlags} />
+					Usar Aikar flags (preset de GC recomendado para Minecraft)
+				</label>
+
 				<label class="full">
-					Argumentos JVM
+					Argumentos JVM extra
 					<textarea rows="2" placeholder="-XX:+UseG1GC …" bind:value={form.jvmArgs}></textarea>
 				</label>
 
@@ -1503,6 +1525,28 @@
 		background: var(--bg-elev);
 		border-radius: 4px;
 		overflow: hidden;
+	}
+	.hprow {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+	}
+	.hcancel {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--text-dim);
+		border-radius: 6px;
+		padding: 3px 8px;
+		font-size: 11px;
+		white-space: nowrap;
+	}
+	.hcancel:hover {
+		color: var(--text);
+		border-color: var(--text-dim);
 	}
 	.hfill {
 		height: 100%;

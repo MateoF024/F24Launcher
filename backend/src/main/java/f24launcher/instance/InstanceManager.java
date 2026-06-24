@@ -47,6 +47,31 @@ public class InstanceManager {
         return readConfig(LauncherPaths.instanceData(id).resolve("instance.json"));
     }
 
+    /**
+     * Al arrancar, marca como NO instaladas las instancias cuyo cliente base
+     * (versions/&lt;mc&gt;/&lt;mc&gt;.jar) falte. Tras un fallo o un cierre a mitad podían
+     * quedar con {@code installed=true} sin ser jugables; así la UI ofrece reinstalar
+     * en vez de fallar al lanzar.
+     */
+    public void reconcileInstalledStates() {
+        for (InstanceConfig cfg : list()) {
+            if (!cfg.installed || cfg.mcVersion == null || cfg.mcVersion.isBlank()) continue;
+            Path jar = LauncherPaths.versionJar(cfg.mcVersion);
+            boolean ok;
+            try {
+                ok = Files.exists(jar) && Files.size(jar) > 0;
+            } catch (IOException e) {
+                ok = false;
+            }
+            if (!ok) {
+                cfg.installed = false;
+                save(cfg);
+                log.warn("Instancia {} marcada como no instalada: falta el cliente base {} ({}).",
+                        cfg.id, cfg.mcVersion, jar);
+            }
+        }
+    }
+
     /** Crea una instancia nueva (con los valores por defecto de AppSettings) y devuelve su config. */
     public synchronized InstanceConfig create(String name, String mcVersion,
                                               String loader, String loaderVersion) {

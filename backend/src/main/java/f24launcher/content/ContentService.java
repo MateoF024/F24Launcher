@@ -2,6 +2,7 @@ package f24launcher.content;
 
 import f24launcher.content.ContentModels.*;
 import f24launcher.util.HttpConnectionPool;
+import f24launcher.util.TtlCache;
 
 import com.google.gson.*;
 
@@ -23,6 +24,19 @@ public class ContentService {
     private static final int CF_GAME = 432;
 
     private final Gson gson = new Gson();
+
+    // Cachés de metadatos de sesión (no se cachea la búsqueda: el usuario espera
+    // resultados frescos). Se purgan desde Ajustes (clearCaches).
+    private final TtlCache<String, ProjectDetail> projectCache = new TtlCache<>(10 * 60_000, 200);
+    private final TtlCache<String, List<Version>> versionsCache = new TtlCache<>(3 * 60_000, 200);
+    private final TtlCache<String, List<Category>> categoriesCache = new TtlCache<>(30 * 60_000, 50);
+
+    /** Vacía las cachés de metadatos en memoria (lo invoca "Purgar caché"). */
+    public void clearCaches() {
+        projectCache.clear();
+        versionsCache.clear();
+        categoriesCache.clear();
+    }
 
     // ── Búsqueda ──────────────────────────────────────────────────────
 
@@ -123,7 +137,12 @@ public class ContentService {
     // ── Página del proyecto ───────────────────────────────────────────
 
     public ProjectDetail project(String source, ContentType type, String id) throws Exception {
-        return "curseforge".equals(source) ? curseForgeProject(type, id) : modrinthProject(type, id);
+        String key = source + ":" + type.id + ":" + id;
+        ProjectDetail cached = projectCache.get(key);
+        if (cached != null) return cached;
+        ProjectDetail r = "curseforge".equals(source) ? curseForgeProject(type, id) : modrinthProject(type, id);
+        projectCache.put(key, r);
+        return r;
     }
 
     private ProjectDetail modrinthProject(ContentType type, String id) throws Exception {
@@ -177,28 +196,119 @@ public class ContentService {
                 lng(m, "downloadCount"), 0, cfCategories(m), gallery, links, "", "", "");
     }
 
-    // ── Identificación por hash (mods externos) ───────────────────────
+    // ── Identificación de mods externos (hash / fingerprint, en lote) ──
 
-    public record ModrinthHit(String projectId, String versionId, String versionNumber) {}
+    public record ModrinthHit(String projectId, String versionId, String versionNumber,
+                              String downloadUrl, String sha1, String sha512, long fileSize) {}
 
-    /** Busca una versión de Modrinth por el SHA1 del archivo; null si no existe. */
-    public ModrinthHit modrinthByHash(String sha1) {
+    public record CfMatch(String projectId, String fileId, String fileName,
+                          String downloadUrl, String sha1, long fileSize) {}
+
+    /**
+     * Identifica varios archivos en Modrinth por su SHA1 de una sola vez
+     * (POST /version_files). Devuelve un mapa sha1 → versión encontrada.
+     */
+    public Map<String, ModrinthHit> modrinthByHashes(Collection<String> sha1s) {
+        Map<String, ModrinthHit> out = new HashMap<>();
+        if (sha1s == null || sha1s.isEmpty()) return out;
         try {
-            JsonObject v = obj(http(MR + "/version_file/" + sha1 + "?algorithm=sha1"));
-            if (v == null || !v.has("project_id")) return null;
-            return new ModrinthHit(str(v, "project_id"), str(v, "id"), str(v, "version_number"));
+            JsonObject body = new JsonObject();
+            JsonArray hashes = new JsonArray();
+            for (String h : sha1s) hashes.add(h);
+            body.add("hashes", hashes);
+            body.addProperty("algorithm", "sha1");
+            String resp = HttpConnectionPool.getInstance().post(MR + "/version_files", gson.toJson(body));
+            JsonObject map = gson.fromJson(resp, JsonObject.class);
+            if (map == null) return out;
+            for (String sha1 : map.keySet()) {
+                if (!map.get(sha1).isJsonObject()) continue;
+                JsonObject v = map.getAsJsonObject(sha1);
+                if (!v.has("project_id")) continue;
+                String url = "", sha512 = "";
+                long size = 0;
+                JsonObject file = fileByHash(v.has("files") ? v.getAsJsonArray("files") : null, sha1);
+                if (file != null) {
+                    url = str(file, "url");
+                    size = lng(file, "size");
+                    if (file.has("hashes") && file.get("hashes").isJsonObject())
+                        sha512 = str(file.getAsJsonObject("hashes"), "sha512");
+                }
+                out.put(sha1, new ModrinthHit(str(v, "project_id"), str(v, "id"),
+                        str(v, "version_number"), url, sha1, sha512, size));
+            }
         } catch (Exception e) {
-            return null;
+            // sin conexión o respuesta inesperada → sin resultados
         }
+        return out;
+    }
+
+    private JsonObject fileByHash(JsonArray files, String sha1) {
+        if (files == null) return null;
+        for (JsonElement el : files) {
+            JsonObject f = el.getAsJsonObject();
+            if (f.has("hashes") && f.get("hashes").isJsonObject()
+                    && sha1.equalsIgnoreCase(str(f.getAsJsonObject("hashes"), "sha1"))) return f;
+        }
+        return primaryFile(files);
+    }
+
+    /**
+     * Identifica varios archivos en CurseForge por su fingerprint murmur2 de una
+     * sola vez (POST /fingerprints). Devuelve un mapa fingerprint → archivo encontrado.
+     * Degrada con elegancia (mapa vacío) si el proxy no admite el endpoint.
+     */
+    public Map<Long, CfMatch> curseForgeByFingerprints(Collection<Long> fingerprints) {
+        Map<Long, CfMatch> out = new HashMap<>();
+        if (fingerprints == null || fingerprints.isEmpty()) return out;
+        try {
+            JsonObject body = new JsonObject();
+            JsonArray arr = new JsonArray();
+            for (Long fp : fingerprints) arr.add(fp);
+            body.add("fingerprints", arr);
+            String resp = HttpConnectionPool.getInstance().post(CF + "/fingerprints", gson.toJson(body));
+            JsonObject root = gson.fromJson(resp, JsonObject.class);
+            if (root == null || !root.has("data") || !root.get("data").isJsonObject()) return out;
+            JsonObject data = root.getAsJsonObject("data");
+            if (!data.has("exactMatches")) return out;
+            for (JsonElement el : data.getAsJsonArray("exactMatches")) {
+                JsonObject m = el.getAsJsonObject();
+                if (!m.has("file") || !m.get("file").isJsonObject()) continue;
+                JsonObject f = m.getAsJsonObject("file");
+                long fp = f.has("fileFingerprint") && !f.get("fileFingerprint").isJsonNull()
+                        ? f.get("fileFingerprint").getAsLong() : 0;
+                if (fp == 0) continue;
+                String url = cfDownloadUrl(f);
+                out.put(fp, new CfMatch(str(f, "modId"), str(f, "id"), str(f, "displayName"),
+                        url != null ? url : "", cfHashSha1(f), lng(f, "fileLength")));
+            }
+        } catch (Exception e) {
+            // el proxy puede no admitir POST /fingerprints → sin resultados de CF
+        }
+        return out;
+    }
+
+    private String cfHashSha1(JsonObject file) {
+        if (file.has("hashes") && file.get("hashes").isJsonArray())
+            for (JsonElement he : file.getAsJsonArray("hashes")) {
+                JsonObject h = he.getAsJsonObject();
+                if (h.has("algo") && h.get("algo").getAsInt() == 1 && h.has("value"))
+                    return h.get("value").getAsString();
+            }
+        return "";
     }
 
     // ── Versiones ─────────────────────────────────────────────────────
 
     public List<Version> versions(String source, ContentType type, String id,
                                   String mc, String loader, boolean ignore) throws Exception {
-        return "curseforge".equals(source)
+        String key = source + ":" + type.id + ":" + id + ":" + mc + ":" + loader + ":" + ignore;
+        List<Version> cached = versionsCache.get(key);
+        if (cached != null) return cached;
+        List<Version> r = "curseforge".equals(source)
                 ? curseForgeVersions(type, id, mc, loader, ignore)
                 : modrinthVersions(type, id, mc, loader, ignore);
+        versionsCache.put(key, r);
+        return r;
     }
 
     private List<Version> modrinthVersions(ContentType type, String id, String mc,
@@ -281,6 +391,9 @@ public class ContentService {
     // ── Categorías (facetas) ──────────────────────────────────────────
 
     public List<Category> categories(String source, ContentType type) throws Exception {
+        String key = source + ":" + type.id;
+        List<Category> cached = categoriesCache.get(key);
+        if (cached != null) return cached;
         List<Category> out = new ArrayList<>();
         if ("curseforge".equals(source)) {
             if (type.cfClassId < 0) return out;
@@ -305,6 +418,7 @@ public class ContentService {
                 }
             }
         }
+        categoriesCache.put(key, out);
         return out;
     }
 

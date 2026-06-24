@@ -1,13 +1,27 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { ipcReady, getSettings, updateSettings, type AppSettingsDto } from '$lib/ipc';
+	import {
+		ipcReady,
+		getSettings,
+		updateSettings,
+		purgeCache,
+		openLogsFolder,
+		exportDiagnostics,
+		restartApp,
+		type AppSettingsDto
+	} from '$lib/ipc';
 	import { setSettings, applyTheme } from '$lib/store.svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { fade } from 'svelte/transition';
 
 	let s = $state<AppSettingsDto | null>(null);
 	let saving = $state(false);
-	let version = $state('0.0.2');
+	let version = $state('0.0.3');
+	let needsRestart = $state(false);
+	let purging = $state(false);
+	let purgeMsg = $state('');
+	let exporting = $state(false);
+	let diagMsg = $state('');
 
 	const SIZES = [
 		{ w: 1280, h: 720, label: '1280 × 720' },
@@ -52,6 +66,58 @@
 		commit({ launcherWidth: w, launcherHeight: h });
 	}
 
+	// Los límites de concurrencia se leen al arrancar el backend → requieren reinicio.
+	async function commitConcurrency(patch: Partial<AppSettingsDto>) {
+		await commit(patch);
+		needsRestart = true;
+	}
+
+	async function doPurge() {
+		purging = true;
+		purgeMsg = '';
+		try {
+			const { freedBytes } = await purgeCache();
+			purgeMsg =
+				freedBytes > 0
+					? `Caché purgada · ${(freedBytes / (1024 * 1024)).toFixed(1)} MB liberados`
+					: 'Caché purgada';
+		} catch {
+			purgeMsg = 'No se pudo purgar la caché';
+		} finally {
+			purging = false;
+		}
+	}
+
+	async function doOpenLogs() {
+		try {
+			await openLogsFolder();
+		} catch {
+			diagMsg = 'No se pudo abrir la carpeta de logs';
+		}
+	}
+
+	async function doExport() {
+		exporting = true;
+		diagMsg = '';
+		try {
+			const { path } = await exportDiagnostics();
+			diagMsg = `Diagnóstico exportado: ${path}`;
+			await openLogsFolder();
+		} catch {
+			diagMsg = 'No se pudo exportar el diagnóstico';
+		} finally {
+			exporting = false;
+		}
+	}
+
+	async function doRestart() {
+		try {
+			await restartApp();
+		} catch {
+			/* fuera de Tauri (navegador dev) */
+		}
+	}
+
 	const effectiveInstancesPath = $derived(s ? s.instancesPath || s.defaultInstancesPath : '');
 
 	async function pickInstancesFolder() {
@@ -73,6 +139,14 @@
 	<h1>Ajustes</h1>
 	{#if saving}<span class="dim small" transition:fade={{ duration: 120 }}>Guardando…</span>{/if}
 </header>
+
+{#if needsRestart}
+	<div class="banner" transition:fade={{ duration: 150 }}>
+		<Icon name="refresh" size={16} />
+		<span>Algunos cambios requieren reiniciar el launcher para aplicarse.</span>
+		<button class="restart" onclick={doRestart}>Reiniciar ahora</button>
+	</div>
+{/if}
 
 {#if !s}
 	<p class="dim">Cargando ajustes…</p>
@@ -202,6 +276,71 @@
 			Mostrar versiones beta y snapshots
 		</label>
 	</section>
+
+	<section class="card">
+		<h2>Descargas</h2>
+		<p class="dim small">
+			Cuántos archivos descarga y escribe el launcher a la vez. Baja estos valores si tu conexión o
+			tu disco son lentos. Se aplican al reiniciar.
+		</p>
+		<label class="full">
+			<span>Descargas en paralelo · <strong>{s.maxConcurrentDownloads}</strong></span>
+			<input
+				type="range"
+				min="1"
+				max="16"
+				step="1"
+				value={s.maxConcurrentDownloads}
+				onchange={(e) => commitConcurrency({ maxConcurrentDownloads: Number(e.currentTarget.value) })}
+			/>
+		</label>
+		<label class="full">
+			<span>Escrituras en disco en paralelo · <strong>{s.maxConcurrentWrites}</strong></span>
+			<input
+				type="range"
+				min="1"
+				max="32"
+				step="1"
+				value={s.maxConcurrentWrites}
+				onchange={(e) => commitConcurrency({ maxConcurrentWrites: Number(e.currentTarget.value) })}
+			/>
+		</label>
+		<p class="dim small">
+			El valor por defecto de escrituras se ajusta a los núcleos de tu procesador.
+		</p>
+	</section>
+
+	<section class="card">
+		<h2>Caché de la app</h2>
+		<p class="dim small">
+			El launcher guarda una caché de datos para acelerar la carga. Purgarla la fuerza a recargar
+			(puede ir más lento un momento). No afecta a tus instancias ni a los archivos del juego.
+		</p>
+		<div class="cacherow">
+			<button class="ghost" onclick={doPurge} disabled={purging}>
+				<Icon name="trash" size={15} />{purging ? 'Purgando…' : 'Purgar caché'}
+			</button>
+			{#if purgeMsg}<span class="dim small" transition:fade={{ duration: 120 }}>{purgeMsg}</span>{/if}
+		</div>
+	</section>
+
+	<section class="card">
+		<h2>Diagnóstico</h2>
+		<p class="dim small">
+			El launcher guarda registros de cada sesión (los anteriores se comprimen en .zip). Si algo
+			falla, exporta un diagnóstico y compártelo: incluye los logs recientes y los ajustes (sin
+			datos de tu cuenta).
+		</p>
+		<div class="cacherow">
+			<button class="ghost" onclick={doOpenLogs}>
+				<Icon name="folder" size={15} />Abrir carpeta de logs
+			</button>
+			<button class="ghost" onclick={doExport} disabled={exporting}>
+				<Icon name="download" size={15} />{exporting ? 'Exportando…' : 'Exportar diagnóstico'}
+			</button>
+			{#if diagMsg}<span class="dim small" transition:fade={{ duration: 120 }}>{diagMsg}</span>{/if}
+		</div>
+	</section>
 {/if}
 
 <footer class="about">
@@ -280,6 +419,34 @@
 		display: grid;
 		grid-template-columns: repeat(3, 1fr);
 		gap: 12px;
+	}
+	.banner {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		max-width: 620px;
+		margin-bottom: 16px;
+		padding: 12px 16px;
+		background: var(--bg-elev);
+		border: 1px solid var(--accent);
+		border-radius: var(--radius);
+		font-size: 13px;
+	}
+	.banner span {
+		flex: 1;
+	}
+	.banner .restart {
+		background: var(--accent);
+		color: #fff;
+		border: none;
+		padding: 8px 14px;
+		font-weight: 600;
+		white-space: nowrap;
+	}
+	.cacherow {
+		display: flex;
+		gap: 12px;
+		align-items: center;
 	}
 	.pathrow {
 		display: flex;

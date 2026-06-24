@@ -4,13 +4,18 @@ import f24launcher.content.ContentModels.*;
 import f24launcher.core.LauncherPaths;
 import f24launcher.core.version.VanillaInstaller;
 import f24launcher.instance.InstanceConfig;
+import f24launcher.util.DownloadManager;
 import f24launcher.util.HttpConnectionPool;
+import f24launcher.util.Murmur2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Stream;
 
 /**
@@ -22,6 +27,7 @@ public class ContentInstaller {
     private static final Logger log = LoggerFactory.getLogger(ContentInstaller.class);
 
     private final ContentService service;
+    private final DownloadManager dm = DownloadManager.getInstance();
 
     public ContentInstaller(ContentService service) { this.service = service; }
 
@@ -47,7 +53,8 @@ public class ContentInstaller {
         Files.createDirectories(dir);
         Path dest = dir.resolve(sanitize(version.fileName()));
         byte[] data = HttpConnectionPool.getInstance().getBytes(version.downloadUrl());
-        Files.write(dest, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        String sha1 = hex(data, "SHA-1");
+        ObjectStore.linkWrite(dest, data, sha1); // dedup: store + hardlink (cae a copia atómica si no se puede)
 
         ProjectDetail meta = safeDetail(source, type, projectId);
         ContentManifest.Entry e = manifest.find(source, projectId, type.id);
@@ -68,7 +75,7 @@ public class ContentInstaller {
         e.serverSide = meta != null ? meta.serverSide() : "";
         e.downloadUrl = version.downloadUrl();
         e.fileSize = data.length;
-        e.sha1 = hex(data, "SHA-1");
+        e.sha1 = sha1;
         e.sha512 = hex(data, "SHA-512");
 
         // Dependencias requeridas (se tratan como mods).
@@ -147,59 +154,74 @@ public class ContentInstaller {
     }
 
     /**
-     * Intenta identificar los mods/archivos añadidos manualmente (sin entrada en
-     * el manifiesto): primero por hash en Modrinth y, si falla, por nombre en
-     * CurseForge. Los que se reconocen se persisten en el manifiesto.
+     * Identifica los mods/archivos añadidos manualmente (sin entrada en el
+     * manifiesto). Lee cada archivo una vez (SHA1 + fingerprint murmur2) y consulta
+     * en lote Modrinth (por SHA1) y CurseForge (por fingerprint, identificación
+     * exacta). Persiste lo reconocido, con los datos para reparar/exportar.
      */
     public List<InstalledItem> identify(InstanceConfig cfg) {
+        long t0 = System.nanoTime();
         ContentManifest manifest = ContentManifest.load(cfg.id);
-        boolean dirty = false;
+        List<Pending> pending = new ArrayList<>();
         for (ContentType type : ContentType.values()) {
             Path dir = folder(cfg, type);
             if (!Files.isDirectory(dir)) continue;
             try (Stream<Path> files = Files.list(dir)) {
                 for (Path p : files.filter(Files::isRegularFile).toList()) {
                     String fn = p.getFileName().toString();
-                    if (!isContentFile(fn)) continue;
-                    if (manifest.findByFile(fn) != null) continue;
-                    ContentManifest.Entry e = resolveMeta(cfg, type, p, fn);
-                    if (e != null) { manifest.items.add(e); dirty = true; }
+                    if (!isContentFile(fn) || manifest.findByFile(fn) != null) continue;
+                    try {
+                        byte[] data = Files.readAllBytes(p);
+                        pending.add(new Pending(type, fn, hex(data, "SHA-1"),
+                                Murmur2.curseForgeFingerprint(data), data.length));
+                    } catch (Exception ex) {
+                        log.debug("No se pudo leer {}: {}", fn, ex.getMessage());
+                    }
                 }
             } catch (Exception ignored) {}
         }
-        if (dirty) manifest.save(cfg.id);
+        if (pending.isEmpty()) return list(cfg);
+
+        Set<String> sha1s = new HashSet<>();
+        Set<Long> fingerprints = new HashSet<>();
+        for (Pending p : pending) { sha1s.add(p.sha1()); fingerprints.add(p.fingerprint()); }
+        Map<String, ContentService.ModrinthHit> mr = service.modrinthByHashes(sha1s);
+        Map<Long, ContentService.CfMatch> cf = service.curseForgeByFingerprints(fingerprints);
+        log.info("identify {}: {} archivo(s) sin identificar · Modrinth {} · CurseForge {}",
+                cfg.id, pending.size(), mr.size(), cf.size());
+
+        int identified = 0;
+        for (Pending p : pending) {
+            ContentManifest.Entry e = null;
+            ContentService.ModrinthHit h = mr.get(p.sha1());
+            if (h != null) {
+                ProjectDetail d = safeDetail("modrinth", p.type(), h.projectId());
+                e = entryFrom(p.fileName(), p.type(), "modrinth", h.projectId(), h.versionId(), h.versionNumber(), d);
+                fillExport(e, h.downloadUrl(), p.sha1(), h.sha512(), p.size());
+            } else {
+                ContentService.CfMatch m = cf.get(p.fingerprint());
+                if (m != null) {
+                    ProjectDetail d = safeDetail("curseforge", p.type(), m.projectId());
+                    e = entryFrom(p.fileName(), p.type(), "curseforge", m.projectId(), m.fileId(), m.fileName(), d);
+                    fillExport(e, m.downloadUrl(), p.sha1(), "", p.size());
+                }
+            }
+            if (e != null) { manifest.items.add(e); identified++; }
+        }
+        if (identified > 0) manifest.save(cfg.id);
+        log.info("identify {}: {} identificado(s) en {} ms", cfg.id, identified, (System.nanoTime() - t0) / 1_000_000);
         return list(cfg);
     }
 
-    private ContentManifest.Entry resolveMeta(InstanceConfig cfg, ContentType type, Path file, String fileName) {
-        try {
-            String sha1 = sha1(file);
-            ContentService.ModrinthHit hit = service.modrinthByHash(sha1);
-            if (hit != null) {
-                ProjectDetail d = safeDetail("modrinth", type, hit.projectId());
-                return entryFrom(fileName, type, "modrinth", hit.projectId(),
-                        hit.versionId(), hit.versionNumber(), d);
-            }
-        } catch (Exception e) {
-            log.debug("hash {}: {}", fileName, e.getMessage());
-        }
-        try {
-            String term = searchTerm(fileName);
-            if (term.length() >= 3) {
-                var res = service.search("curseforge", type, cfg.mcVersion, cfg.loader,
-                        term, null, null, "relevance", 0, true);
-                if (!res.hits().isEmpty()) {
-                    Project p = res.hits().get(0);
-                    if (looseMatch(term, p.name(), p.slug())) {
-                        ProjectDetail d = safeDetail("curseforge", type, p.id());
-                        return entryFrom(fileName, type, "curseforge", p.id(), "", "", d);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("cf search {}: {}", fileName, e.getMessage());
-        }
-        return null;
+    /** Archivo pendiente de identificar: tipo, nombre, sha1, fingerprint CF y tamaño. */
+    private record Pending(ContentType type, String fileName, String sha1, long fingerprint, long size) {}
+
+    /** Rellena los datos de reparación/export (downloadUrl + hashes + tamaño) de un mod identificado. */
+    private void fillExport(ContentManifest.Entry e, String downloadUrl, String sha1, String sha512, long size) {
+        e.downloadUrl = downloadUrl != null ? downloadUrl : "";
+        e.sha1 = sha1 != null ? sha1 : "";
+        e.sha512 = sha512 != null ? sha512 : "";
+        e.fileSize = size;
     }
 
     private ContentManifest.Entry entryFrom(String fileName, ContentType type, String source,
@@ -222,31 +244,6 @@ public class ContentInstaller {
         return e;
     }
 
-    /** Deriva un término de búsqueda del nombre de archivo (quita versión, loader, extensión). */
-    private String searchTerm(String fileName) {
-        String f = fileName.endsWith(".disabled") ? fileName.substring(0, fileName.length() - 9) : fileName;
-        f = f.replaceAll("\\.(jar|zip)$", "");
-        StringBuilder sb = new StringBuilder();
-        for (String tok : f.split("[-_+\\s]+")) {
-            String t = tok.toLowerCase(Locale.ROOT);
-            if (t.isEmpty() || t.matches(".*\\d.*")) continue;
-            if (t.equals("fabric") || t.equals("forge") || t.equals("neoforge") || t.equals("quilt")
-                    || t.equals("mc") || t.equals("mod")) continue;
-            sb.append(sb.isEmpty() ? "" : " ").append(tok);
-        }
-        return sb.toString().trim();
-    }
-
-    private boolean looseMatch(String term, String name, String slug) {
-        String t = norm(term), n = norm(name), s = norm(slug);
-        if (t.isEmpty()) return false;
-        return n.contains(t) || t.contains(n) || s.contains(t) || t.contains(s);
-    }
-
-    private static String norm(String s) {
-        return s == null ? "" : s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
-    }
-
     /** Hash hexadecimal de unos bytes (p. ej. SHA-1 / SHA-512). "" si falla. */
     public static String hex(byte[] data, String algorithm) {
         try {
@@ -257,14 +254,6 @@ public class ContentInstaller {
         } catch (Exception e) {
             return "";
         }
-    }
-
-    private static String sha1(Path file) throws Exception {
-        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
-        byte[] hash = md.digest(Files.readAllBytes(file));
-        StringBuilder sb = new StringBuilder(hash.length * 2);
-        for (byte b : hash) sb.append(String.format("%02x", b));
-        return sb.toString();
     }
 
     public Path folder(InstanceConfig cfg, ContentType type) {
@@ -302,42 +291,19 @@ public class ContentInstaller {
      */
     public int repair(InstanceConfig cfg, VanillaInstaller.Sink sink) {
         ContentManifest manifest = ContentManifest.load(cfg.id);
-        List<ContentManifest.Entry> checkable = new ArrayList<>();
+        List<DownloadManager.Task> tasks = new ArrayList<>();
         for (ContentManifest.Entry e : manifest.items) {
-            if (e.downloadUrl != null && !e.downloadUrl.isBlank() && e.sha1 != null && !e.sha1.isBlank())
-                checkable.add(e);
+            if (e.downloadUrl == null || e.downloadUrl.isBlank() || e.sha1 == null || e.sha1.isBlank()) continue;
+            Path file = folder(cfg, ContentType.from(e.type)).resolve(e.fileName);
+            tasks.add(new DownloadManager.Task(e.downloadUrl, file, e.fileSize, e.sha1, e.sha512));
         }
-        long total = Math.max(1, checkable.size());
-        long done = 0;
+        if (tasks.isEmpty()) { sink.update("Verificando contenido", 0, 0); return 0; }
+        // verifyExisting=true → comprueba el hash de lo presente y re-descarga lo que falte o no cuadre (con dedup).
+        List<DownloadManager.Result> results =
+                dm.downloadAll(tasks, (d, t) -> sink.update("Verificando contenido", d, t), true, ObjectStore::linkWriteFile);
         int fixed = 0;
-        sink.update("Verificando contenido", 0, total);
-        for (ContentManifest.Entry e : checkable) {
-            Path dir = folder(cfg, ContentType.from(e.type));
-            Path file = dir.resolve(e.fileName);
-            boolean ok = false;
-            try {
-                if (Files.exists(file)) ok = e.sha1.equalsIgnoreCase(sha1(file));
-            } catch (Exception ex) {
-                ok = false;
-            }
-            if (!ok) {
-                try {
-                    byte[] data = HttpConnectionPool.getInstance().getBytes(e.downloadUrl);
-                    String got = hex(data, "SHA-1");
-                    if (got.equalsIgnoreCase(e.sha1)) {
-                        Files.createDirectories(dir);
-                        Files.write(file, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                        fixed++;
-                    } else {
-                        log.warn("Hash no coincide al reparar {} en {}", e.fileName, cfg.id);
-                    }
-                } catch (Exception ex) {
-                    log.warn("No se pudo reparar {}: {}", e.fileName, ex.getMessage());
-                }
-            }
-            sink.update("Verificando contenido", ++done, total);
-        }
-        log.info("Reparación de {}: {} archivo(s) restaurado(s) de {} comprobados.", cfg.id, fixed, checkable.size());
+        for (DownloadManager.Result r : results) if (r.status() == DownloadManager.Status.DOWNLOADED) fixed++;
+        log.info("Reparación de {}: {} archivo(s) restaurado(s) de {} comprobados.", cfg.id, fixed, tasks.size());
         return fixed;
     }
 
@@ -348,24 +314,44 @@ public class ContentInstaller {
         return null;
     }
 
-    /** Calcula las actualizaciones disponibles para el contenido instalado con proyecto vinculado. */
+    /** Calcula las actualizaciones disponibles para el contenido instalado con proyecto vinculado (en paralelo). */
     public List<UpdateInfo> updates(InstanceConfig cfg) {
+        long t0 = System.nanoTime();
         ContentManifest manifest = ContentManifest.load(cfg.id);
         List<UpdateInfo> out = new ArrayList<>();
-        for (ContentManifest.Entry e : manifest.items) {
-            if (e.projectId == null || e.projectId.isBlank() || e.versionId == null) continue;
-            try {
-                ContentType type = ContentType.from(e.type);
-                List<Version> versions = service.versions(e.source, type, e.projectId, cfg.mcVersion, cfg.loader, false);
-                if (versions.isEmpty()) continue;
-                Version latest = newest(versions);
-                if (latest != null && !latest.id().equals(e.versionId))
-                    out.add(new UpdateInfo(e.fileName, e.type, latest.id(), latest.versionNumber()));
-            } catch (Exception ex) {
-                log.debug("No se pudo comprobar update de {}: {}", e.projectId, ex.getMessage());
+        int checked = 0;
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<UpdateInfo>> futures = new ArrayList<>();
+            for (ContentManifest.Entry e : manifest.items) {
+                if (e.projectId == null || e.projectId.isBlank() || e.versionId == null) continue;
+                checked++;
+                futures.add(exec.submit(() -> updateOne(e, cfg)));
+            }
+            for (Future<UpdateInfo> f : futures) {
+                try {
+                    UpdateInfo u = f.get();
+                    if (u != null) out.add(u);
+                } catch (Exception ignored) {}
             }
         }
+        log.info("updates {}: {} con actualización de {} comprobado(s) en {} ms",
+                cfg.id, out.size(), checked, (System.nanoTime() - t0) / 1_000_000);
         return out;
+    }
+
+    private UpdateInfo updateOne(ContentManifest.Entry e, InstanceConfig cfg) {
+        try {
+            ContentType type = ContentType.from(e.type);
+            List<Version> versions = service.versions(e.source, type, e.projectId, cfg.mcVersion, cfg.loader, false);
+            if (versions.isEmpty()) return null;
+            Version latest = newest(versions);
+            if (latest != null && !latest.id().equals(e.versionId))
+                return new UpdateInfo(e.fileName, e.type, latest.id(), latest.versionNumber());
+            return null;
+        } catch (Exception ex) {
+            log.debug("No se pudo comprobar update de {}: {}", e.projectId, ex.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -374,36 +360,43 @@ public class ContentInstaller {
      * shaders y datapacks no dependen del loader. Ver {@link CompatItem}.
      */
     public List<CompatItem> compat(InstanceConfig cfg, String targetMc, String targetLoader) {
+        long t0 = System.nanoTime();
         ContentManifest manifest = ContentManifest.load(cfg.id);
         List<CompatItem> out = new ArrayList<>();
-        for (ContentManifest.Entry e : manifest.items) {
-            ContentType type = ContentType.from(e.type);
-            if (e.projectId == null || e.projectId.isBlank() || e.source == null || e.source.isBlank()) {
-                out.add(new CompatItem(e.fileName, e.type, e.name, "unknown", "", ""));
-                continue;
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<CompatItem>> futures = new ArrayList<>();
+            for (ContentManifest.Entry e : manifest.items) {
+                futures.add(exec.submit(() -> compatOne(e, targetMc, targetLoader)));
             }
-            try {
-                List<Version> versions = service.versions(e.source, type, e.projectId, targetMc, targetLoader, false);
-                if (versions.isEmpty()) {
-                    out.add(new CompatItem(e.fileName, e.type, e.name, "incompatible", "", ""));
-                    continue;
-                }
-                Version latest = newest(versions);
-                boolean currentOk = e.versionId != null
-                        && versions.stream().anyMatch(v -> v.id().equals(e.versionId));
-                if (currentOk && latest != null && latest.id().equals(e.versionId)) {
-                    out.add(new CompatItem(e.fileName, e.type, e.name, "compatible", e.versionId, e.versionName));
-                } else {
-                    String vid = latest != null ? latest.id() : "";
-                    String vname = latest != null ? latest.versionNumber() : "";
-                    out.add(new CompatItem(e.fileName, e.type, e.name, "updatable", vid, vname));
-                }
-            } catch (Exception ex) {
-                log.debug("compat {}: {}", e.projectId, ex.getMessage());
-                out.add(new CompatItem(e.fileName, e.type, e.name, "unknown", "", ""));
+            for (Future<CompatItem> f : futures) {
+                try { out.add(f.get()); } catch (Exception ignored) {}
             }
         }
+        log.info("compat {} → MC {} · loader {}: {} ítem(s) evaluados en {} ms",
+                cfg.id, targetMc, targetLoader, out.size(), (System.nanoTime() - t0) / 1_000_000);
         return out;
+    }
+
+    private CompatItem compatOne(ContentManifest.Entry e, String targetMc, String targetLoader) {
+        ContentType type = ContentType.from(e.type);
+        if (e.projectId == null || e.projectId.isBlank() || e.source == null || e.source.isBlank())
+            return new CompatItem(e.fileName, e.type, e.name, "unknown", "", "");
+        try {
+            List<Version> versions = service.versions(e.source, type, e.projectId, targetMc, targetLoader, false);
+            if (versions.isEmpty())
+                return new CompatItem(e.fileName, e.type, e.name, "incompatible", "", "");
+            Version latest = newest(versions);
+            boolean currentOk = e.versionId != null
+                    && versions.stream().anyMatch(v -> v.id().equals(e.versionId));
+            if (currentOk && latest != null && latest.id().equals(e.versionId))
+                return new CompatItem(e.fileName, e.type, e.name, "compatible", e.versionId, e.versionName);
+            String vid = latest != null ? latest.id() : "";
+            String vname = latest != null ? latest.versionNumber() : "";
+            return new CompatItem(e.fileName, e.type, e.name, "updatable", vid, vname);
+        } catch (Exception ex) {
+            log.debug("compat {}: {}", e.projectId, ex.getMessage());
+            return new CompatItem(e.fileName, e.type, e.name, "unknown", "", "");
+        }
     }
 
     private Version newest(List<Version> versions) {

@@ -1,6 +1,8 @@
 package f24launcher.modpack;
 
+import f24launcher.content.ObjectStore;
 import f24launcher.core.version.VanillaInstaller.Sink;
+import f24launcher.util.DownloadManager;
 import f24launcher.util.HttpConnectionPool;
 
 import com.google.gson.Gson;
@@ -19,6 +21,9 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -35,9 +40,13 @@ public class ModpackInstaller {
     private static final String CF = "https://api.curse.tools/v1/cf";
 
     private final HttpConnectionPool http = HttpConnectionPool.getInstance();
+    private final DownloadManager dm = DownloadManager.getInstance();
     private final Gson gson = new Gson();
 
-    public record FileEntry(String path, String url) {}
+    /** Un archivo del modpack: ruta relativa, URL y (si se conocen) tamaño/hashes. */
+    public record FileEntry(String path, String url, long size, String sha1, String sha512) {
+        public FileEntry(String path, String url) { this(path, url, 0, null, null); }
+    }
 
     public record Parsed(String format, String name, String mcVersion,
                          String loader, String loaderVersion,
@@ -72,12 +81,13 @@ public class ModpackInstaller {
         }
     }
 
-    /** Descarga el archivo del modpack a un temporal y devuelve su ruta. */
+    /** Descarga el archivo del modpack a un temporal (por streaming) y devuelve su ruta. */
     public Path download(String url, Sink sink) throws Exception {
         sink.update("Descargando modpack", 0, 1);
-        byte[] data = http.getBytes(url);
         Path tmp = Files.createTempFile("f24-modpack-", guessExt(url));
-        Files.write(tmp, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Files.deleteIfExists(tmp); // el DownloadManager escribe a su .part y mueve aquí
+        DownloadManager.Result r = dm.download(new DownloadManager.Task(url, tmp, 0, null, null), false);
+        if (!r.ok()) throw new IOException("No se pudo descargar el modpack: " + url, r.error());
         sink.update("Descargando modpack", 1, 1);
         return tmp;
     }
@@ -90,24 +100,26 @@ public class ModpackInstaller {
         return new Parsed("zip", "", "", "", "", new ArrayList<>(), "");
     }
 
-    /** Descarga los archivos del modpack y extrae los overrides al .minecraft. */
+    /** Descarga los archivos del modpack (en paralelo) y extrae los overrides al .minecraft. */
     public void apply(Path packFile, Parsed parsed, Path gameDir, Sink sink) throws IOException {
-        long total = parsed.files().size();
-        long done = 0;
-        if (total > 0) {
-            sink.update("Contenido", 0, total);
+        if (!parsed.files().isEmpty()) {
+            List<DownloadManager.Task> tasks = new ArrayList<>();
             for (FileEntry fe : parsed.files()) {
                 Path dest = gameDir.resolve(fe.path()).normalize();
-                if (!dest.startsWith(gameDir)) continue;
-                try {
-                    Files.createDirectories(dest.getParent());
-                    Files.write(dest, http.getBytes(fe.url()),
-                            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                } catch (Exception e) {
-                    log.warn("No se pudo descargar {}: {}", fe.path(), e.getMessage());
-                }
-                sink.update("Contenido", ++done, total);
+                if (!dest.startsWith(gameDir)) continue; // protección zip-slip
+                // Dedup: si el contenido ya está en el store, enlaza y evita la descarga.
+                if (ObjectStore.tryLink(dest, fe.sha1())) continue;
+                tasks.add(new DownloadManager.Task(fe.url(), dest, fe.size(), fe.sha1(), fe.sha512()));
             }
+            List<DownloadManager.Result> results =
+                    dm.downloadAll(tasks, (d, t) -> sink.update("Contenido", d, t), false, ObjectStore::linkWriteFile);
+            for (DownloadManager.Result r : results) {
+                if (r.status() == DownloadManager.Status.FAILED)
+                    log.warn("No se pudo descargar {}: {}", r.task().dest().getFileName(),
+                            r.error() != null ? r.error().getMessage() : "");
+            }
+            if (Thread.currentThread().isInterrupted())
+                throw new IOException("Instalación de modpack cancelada");
         }
         switch (parsed.format()) {
             case "mrpack" -> {
@@ -140,7 +152,14 @@ public class ModpackInstaller {
             String path = str(f, "path");
             JsonArray dl = f.has("downloads") ? f.getAsJsonArray("downloads") : null;
             if (path.isBlank() || dl == null || dl.isEmpty()) continue;
-            files.add(new FileEntry(path, dl.get(0).getAsString()));
+            long size = longOr(f, "fileSize");
+            String sha1 = "", sha512 = "";
+            if (f.has("hashes") && f.get("hashes").isJsonObject()) {
+                JsonObject h = f.getAsJsonObject("hashes");
+                sha1 = str(h, "sha1");
+                sha512 = str(h, "sha512");
+            }
+            files.add(new FileEntry(path, dl.get(0).getAsString(), size, sha1, sha512));
         }
         return new Parsed("mrpack", name, mc, loader, lv, files, "overrides");
     }
@@ -165,20 +184,24 @@ public class ModpackInstaller {
                 }
             }
         }
-        List<FileEntry> files = new ArrayList<>();
+        // Resolver cada archivo del manifiesto (una llamada HTTP por fichero) en paralelo.
+        List<String[]> refs = new ArrayList<>();
         if (manifest.has("files")) for (JsonElement el : manifest.getAsJsonArray("files")) {
             JsonObject f = el.getAsJsonObject();
             if (!f.has("projectID") || !f.has("fileID")) continue;
-            String pid = f.get("projectID").getAsString();
-            String fid = f.get("fileID").getAsString();
-            try {
-                JsonObject resp = gson.fromJson(http.get(CF + "/mods/" + pid + "/files/" + fid), JsonObject.class);
-                JsonObject d = resp.getAsJsonObject("data");
-                String url = cfDownloadUrl(d);
-                String fn = str(d, "fileName");
-                if (url != null && !fn.isBlank()) files.add(new FileEntry("mods/" + fn, url));
-            } catch (Exception e) {
-                log.warn("No se pudo resolver archivo CF {}/{}: {}", pid, fid, e.getMessage());
+            refs.add(new String[]{f.get("projectID").getAsString(), f.get("fileID").getAsString()});
+        }
+        List<FileEntry> files = new ArrayList<>();
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<FileEntry>> futures = new ArrayList<>();
+            for (String[] ref : refs) futures.add(exec.submit(() -> resolveCfFile(ref[0], ref[1])));
+            for (Future<FileEntry> fu : futures) {
+                try {
+                    FileEntry fe = fu.get();
+                    if (fe != null) files.add(fe);
+                } catch (Exception e) {
+                    log.warn("No se pudo resolver un archivo de CurseForge: {}", e.getMessage());
+                }
             }
         }
         String overrides = !str(manifest, "overrides").isBlank() ? str(manifest, "overrides") : "overrides";
@@ -233,6 +256,33 @@ public class ModpackInstaller {
         }
     }
 
+    /** Resuelve un archivo de CurseForge (URL + nombre + tamaño + sha1); null si no se puede. */
+    private FileEntry resolveCfFile(String pid, String fid) {
+        try {
+            JsonObject resp = gson.fromJson(http.get(CF + "/mods/" + pid + "/files/" + fid), JsonObject.class);
+            JsonObject d = resp.getAsJsonObject("data");
+            String url = cfDownloadUrl(d);
+            String fn = str(d, "fileName");
+            if (url == null || fn.isBlank()) return null;
+            return new FileEntry("mods/" + fn, url, longOr(d, "fileLength"), cfSha1(d), "");
+        } catch (Exception e) {
+            log.warn("No se pudo resolver archivo CF {}/{}: {}", pid, fid, e.getMessage());
+            return null;
+        }
+    }
+
+    /** sha1 de un archivo de CurseForge (hashes[].algo == 1); "" si no está. */
+    private String cfSha1(JsonObject file) {
+        if (file.has("hashes") && file.get("hashes").isJsonArray()) {
+            for (JsonElement he : file.getAsJsonArray("hashes")) {
+                JsonObject h = he.getAsJsonObject();
+                if (h.has("algo") && h.get("algo").getAsInt() == 1 && h.has("value"))
+                    return h.get("value").getAsString();
+            }
+        }
+        return "";
+    }
+
     private String cfDownloadUrl(JsonObject file) {
         if (file.has("downloadUrl") && !file.get("downloadUrl").isJsonNull())
             return file.get("downloadUrl").getAsString();
@@ -255,6 +305,14 @@ public class ModpackInstaller {
     private static int intOr(JsonObject o, String key) {
         try {
             return o != null && o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsInt() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static long longOr(JsonObject o, String key) {
+        try {
+            return o != null && o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsLong() : 0;
         } catch (Exception e) {
             return 0;
         }

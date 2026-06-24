@@ -213,7 +213,7 @@
 		window.scrollTo({ top: 0 });
 	}
 
-	async function install(p: ContentProject, versionId?: string) {
+	async function install(p: ContentProject, versionId = '') {
 		const key = p.source + ':' + p.id;
 		const force = versionId ? true : filtersOff;
 		busy = { ...busy, [key]: true };

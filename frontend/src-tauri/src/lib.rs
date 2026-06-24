@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -33,6 +33,83 @@ struct WindowBehavior {
 /// Ruta de un .f24pack/.mrpack con el que se abrió la app (doble clic / CLI), a la
 /// espera de que el frontend la recoja con `take_pending_open` (arranque en frío).
 struct PendingOpen(Mutex<Option<String>>);
+
+/// Log del frontend (L3): líneas del webview (vía `client_log`) y de Rust (vía
+/// `flog`). Se bufferizan hasta que el backend confirma el handshake, momento en el
+/// que ya ha archivado/rotado la sesión anterior y es seguro escribir el
+/// `frontend-latest.log` nuevo. Así este proceso es el ÚNICO escritor del archivo y
+/// nunca colisiona con la rotación que hace el backend al arrancar.
+struct FrontendLog(Mutex<FrontendLogInner>);
+struct FrontendLogInner {
+    ready: bool,
+    buf: Vec<String>,
+}
+
+/// %APPDATA%/F24Launcher/logs (la crea si no existe).
+fn logs_dir() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    let dir = std::path::Path::new(&appdata).join("F24Launcher").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Añade una línea a logs/frontend-latest.log (best-effort).
+fn append_frontend_file(line: &str) {
+    if let Some(dir) = logs_dir() {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("frontend-latest.log"))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Encola o escribe una línea de log del frontend según haya handshake o no.
+fn push_client_line(app: &tauri::AppHandle, line: String) {
+    if let Some(state) = app.try_state::<FrontendLog>() {
+        let mut inner = state.0.lock().unwrap();
+        if inner.ready {
+            append_frontend_file(&line); // bajo lock: serializa las escrituras
+        } else {
+            inner.buf.push(line);
+        }
+    }
+}
+
+/// Marca el log como listo (handshake recibido o timeout) y vuelca el buffer.
+fn mark_log_ready(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<FrontendLog>() {
+        let mut inner = state.0.lock().unwrap();
+        if inner.ready {
+            return;
+        }
+        inner.ready = true;
+        let pending: Vec<String> = std::mem::take(&mut inner.buf);
+        for line in pending {
+            append_frontend_file(&line);
+        }
+    }
+}
+
+/// Log de un evento originado en Rust (spawn del backend, ventana, etc.).
+fn flog(app: &tauri::AppHandle, level: &str, msg: &str) {
+    let line = format!(
+        "{} [{level}] [rust] {msg}",
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f")
+    );
+    eprintln!("[F24] {msg}"); // también a la consola en dev
+    push_client_line(app, line);
+}
+
+/// Comando invocado por el webview para persistir sus líneas de log ya formateadas.
+#[tauri::command]
+fn client_log(app: tauri::AppHandle, lines: Vec<String>) {
+    for line in lines {
+        push_client_line(&app, line);
+    }
+}
 
 /// Busca en los argumentos una ruta de modpack a importar (ignora argv[0]).
 fn pack_path_in(argv: &[String]) -> Option<String> {
@@ -94,6 +171,18 @@ fn show_window(app: tauri::AppHandle) {
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
     quit_app(&app);
+}
+
+/// Relanza la app (botón "Reiniciar ahora" tras cambiar la concurrencia).
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    flog(&app, "INFO", "Reiniciando la app (Reiniciar ahora)");
+    if let Some(state) = app.try_state::<BackendProcess>() {
+        if let Some(mut child) = state.0.lock().unwrap().take() {
+            stop_backend(&mut child);
+        }
+    }
+    app.restart();
 }
 
 /// Crea un acceso directo en el Escritorio que lanza la instancia en segundo plano.
@@ -230,7 +319,7 @@ fn resolve_backend(app: &tauri::AppHandle) -> (std::path::PathBuf, std::path::Pa
 
     if cfg!(debug_assertions) {
         let jar = env_jar.unwrap_or_else(|| {
-            std::path::PathBuf::from("../../backend/build/libs/F24Launcher-0.0.2-Release.jar")
+            std::path::PathBuf::from("../../backend/build/libs/F24Launcher-0.0.3-Release.jar")
         });
         return (std::path::PathBuf::from("java"), jar);
     }
@@ -287,11 +376,26 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-/// Cierre real: mata el backend y termina la app.
+/// Detiene el backend con elegancia: cierra su stdin (EOF → salida limpia que
+/// vuelca el archivo AppCDS y corre los shutdown hooks) y espera un poco; si no
+/// termina, lo mata como fallback.
+fn stop_backend(child: &mut Child) {
+    drop(child.stdin.take());
+    for _ in 0..10 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Cierre real: detiene el backend y termina la app.
 fn quit_app(app: &tauri::AppHandle) {
+    flog(app, "INFO", "Cerrando la app (deteniendo backend)");
     if let Some(state) = app.try_state::<BackendProcess>() {
         if let Some(mut child) = state.0.lock().unwrap().take() {
-            let _ = child.kill();
+            stop_backend(&mut child);
         }
     }
     app.exit(0);
@@ -349,11 +453,36 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 /// handshake (puerto + token), que guarda en el estado IpcState.
 fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<Child> {
     let (java, jar) = resolve_backend(app);
-    eprintln!("[F24] java = {}", java.display());
-    eprintln!("[F24] jar  = {} (existe: {})", jar.display(), jar.exists());
-    let mut child = Command::new(&java)
+    flog(app, "INFO", &format!("Arrancando backend · java = {}", java.display()));
+    flog(app, "INFO", &format!("backend jar = {} (existe: {})", jar.display(), jar.exists()));
+    let mut cmd = Command::new(&java);
+    // Afinado de la JVM del backend (solo en release: en dev el jar cambia a menudo).
+    // Servicio headless pequeño → GC de baja huella, arranque rápido y AppCDS para
+    // recortar el cold start. El archivo .jsa se crea en la primera salida limpia
+    // (ver el watcher de stdin del backend) y se reutiliza/regenera solo.
+    if !cfg!(debug_assertions) {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let base = std::path::Path::new(&appdata).join("F24Launcher");
+        let jsa = base.join("backend.jsa");
+        let dumps = base.join("logs"); // los .hprof de OOM van junto a los logs
+        let _ = std::fs::create_dir_all(&dumps);
+        // G1GC con pausas acotadas y paralelas (SerialGC mono-hilo provocaba pausas
+        // largas stop-the-world bajo la presión de memoria de las descargas). Con el
+        // streaming a disco de la Fase 1, la RAM por descarga es constante, así que el
+        // heap vuelve a su objetivo de huella reducida. Un OOM vuelca un heap dump a
+        // logs/ para poder diagnosticarlo a posteriori.
+        cmd.arg("-XX:+UseG1GC")
+            .arg("-Xmx512m")
+            .arg("-XX:+HeapDumpOnOutOfMemoryError")
+            .arg(format!("-XX:HeapDumpPath={}", dumps.display()))
+            .arg(format!("-XX:SharedArchiveFile={}", jsa.display()))
+            .arg("-XX:+AutoCreateSharedArchive");
+        flog(app, "INFO", &format!("AppCDS jsa: {} (existe: {})", jsa.display(), jsa.exists()));
+    }
+    let mut child = cmd
         .arg("-jar")
         .arg(&jar)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
 
@@ -372,6 +501,8 @@ fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<Child> {
             if let (Some(p), Some(t)) = (port, token.clone()) {
                 let state = handle.state::<IpcState>();
                 *state.0.lock().unwrap() = Some(Handshake { port: p, token: t });
+                flog(&handle, "INFO", &format!("Handshake del backend recibido (puerto {p})"));
+                mark_log_ready(&handle); // el backend ya rotó la sesión anterior → seguro escribir
                 break;
             }
         }
@@ -411,6 +542,10 @@ pub fn run() {
         })
         .manage(PendingOpen(Mutex::new(None)))
         .manage(LaunchTarget(Mutex::new(None)))
+        .manage(FrontendLog(Mutex::new(FrontendLogInner {
+            ready: false,
+            buf: Vec::new(),
+        })))
         .invoke_handler(tauri::generate_handler![
             get_handshake,
             open_external,
@@ -419,8 +554,10 @@ pub fn run() {
             get_launch_target,
             show_window,
             exit_app,
+            restart_app,
             create_instance_shortcut,
-            set_tray_instances
+            set_tray_instances,
+            client_log
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -434,7 +571,20 @@ pub fn run() {
                 Ok(child) => {
                     *app.state::<BackendProcess>().0.lock().unwrap() = Some(child);
                 }
-                Err(e) => eprintln!("No se pudo arrancar el backend Java: {e}"),
+                Err(e) => {
+                    flog(app.handle(), "ERROR", &format!("No se pudo arrancar el backend Java: {e}"));
+                    mark_log_ready(app.handle()); // sin backend: vuelca el log a archivo igualmente
+                }
+            }
+
+            // Red de seguridad: si el handshake nunca llega (backend colgado), volcamos
+            // el log del frontend a archivo tras un tiempo para no perder las pistas.
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    mark_log_ready(&h);
+                });
             }
 
             build_tray(app.handle())?;
@@ -463,6 +613,7 @@ pub fn run() {
                         if behavior.close_to_background.load(Ordering::SeqCst) {
                             api.prevent_close();
                             let _ = w.hide();
+                            flog(w.app_handle(), "INFO", "Ventana ocultada a la bandeja (cerrar = segundo plano)");
                         }
                     }
                     tauri::WindowEvent::Resized(size) => {
@@ -491,7 +642,7 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 if let Some(state) = app.try_state::<BackendProcess>() {
                     if let Some(mut child) = state.0.lock().unwrap().take() {
-                        let _ = child.kill();
+                        stop_backend(&mut child);
                     }
                 }
             }

@@ -41,3 +41,5 @@ tools/*.pfx
 
 # Documentación interna y notas de desarrollo (no se publican)
 /docs/
+/roadmap.md
+/fix.md

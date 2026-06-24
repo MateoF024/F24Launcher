@@ -1,5 +1,7 @@
 package f24launcher.settings;
 
+import f24launcher.util.DownloadManager;
+
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.annotations.Expose;
@@ -41,6 +43,12 @@ public class AppSettings {
     // Comportamiento de ventana.
     @Expose private boolean closeToBackground = false;  // cerrar (X) oculta a la bandeja en vez de salir
     @Expose private boolean minimizeOnLaunch = false;   // minimizar al lanzar una instancia; restaurar al terminar
+
+    // Concurrencia de descargas/escrituras (Fase B). Se leen solo al arrancar
+    // (cambiarlos requiere reiniciar). Descargas es network-bound → valor fijo;
+    // escrituras es disk-bound + hashing → por defecto autodetectado por núcleos.
+    @Expose private int maxConcurrentDownloads = DownloadManager.defaultLimits()[0];
+    @Expose private int maxConcurrentWrites = DownloadManager.defaultLimits()[1];
 
     private AppSettings() {}
 
@@ -109,6 +117,8 @@ public class AppSettings {
         if (p.launcherHeight != null) launcherHeight = clamp(p.launcherHeight, 576, 2160);
         if (p.closeToBackground != null) closeToBackground = p.closeToBackground;
         if (p.minimizeOnLaunch != null) minimizeOnLaunch = p.minimizeOnLaunch;
+        if (p.maxConcurrentDownloads != null) maxConcurrentDownloads = clamp(p.maxConcurrentDownloads, 1, 16);
+        if (p.maxConcurrentWrites != null) maxConcurrentWrites = clamp(p.maxConcurrentWrites, 1, 32);
         save();
     }
 
@@ -126,6 +136,8 @@ public class AppSettings {
         public Integer launcherHeight;
         public Boolean closeToBackground;
         public Boolean minimizeOnLaunch;
+        public Integer maxConcurrentDownloads;
+        public Integer maxConcurrentWrites;
     }
 
     private static int clamp(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
@@ -143,4 +155,6 @@ public class AppSettings {
     public int getLauncherHeight() { return launcherHeight; }
     public boolean isCloseToBackground() { return closeToBackground; }
     public boolean isMinimizeOnLaunch() { return minimizeOnLaunch; }
+    public int getMaxConcurrentDownloads() { return maxConcurrentDownloads > 0 ? maxConcurrentDownloads : DownloadManager.defaultLimits()[0]; }
+    public int getMaxConcurrentWrites() { return maxConcurrentWrites > 0 ? maxConcurrentWrites : DownloadManager.defaultLimits()[1]; }
 }

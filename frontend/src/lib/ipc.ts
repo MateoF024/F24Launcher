@@ -5,6 +5,8 @@
 // evento Tauri `backend-ready`; en `pnpm dev` (navegador) se pueden pasar por
 // querystring: ?port=#####&token=........
 
+import { flog } from './clientLog';
+
 let PORT = 0;
 let TOKEN = '';
 let ready = false;
@@ -23,15 +25,23 @@ const base = () => `http://127.0.0.1:${PORT}`;
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 	if (!ready) throw new Error('IPC no configurado todavía');
-	const res = await fetch(base() + path, {
-		cache: 'no-store',
-		...init,
-		headers: {
-			'X-F24-Token': TOKEN,
-			'Content-Type': 'application/json',
-			...(init.headers ?? {})
-		}
-	});
+	const method = (init.method ?? 'GET').toUpperCase();
+	let res: Response;
+	try {
+		res = await fetch(base() + path, {
+			cache: 'no-store',
+			...init,
+			headers: {
+				'X-F24-Token': TOKEN,
+				'Content-Type': 'application/json',
+				...(init.headers ?? {})
+			}
+		});
+	} catch (e) {
+		// El backend no respondió (caído/congelado): señal directa de "pérdida de conexión".
+		flog('ERROR', `IPC ${method} ${path} sin respuesta:`, e);
+		throw e;
+	}
 	if (!res.ok) {
 		let detail = '';
 		try {
@@ -39,6 +49,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 		} catch {
 			/* sin cuerpo */
 		}
+		flog('WARN', `IPC ${method} ${path} → ${res.status}`, detail);
 		throw new Error(detail || `IPC ${path} → ${res.status}`);
 	}
 	const ct = res.headers.get('content-type') ?? '';
@@ -49,6 +60,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 /** Abre el canal de eventos (progreso, logs, login). */
 export function events(onMessage: (e: { type: string; data: unknown }) => void): WebSocket {
 	const ws = new WebSocket(`ws://127.0.0.1:${PORT}/events?token=${encodeURIComponent(TOKEN)}`);
+	ws.onopen = () => flog('INFO', 'WebSocket /events conectado');
+	ws.onerror = () => flog('ERROR', 'WebSocket /events error');
 	ws.onmessage = (m) => {
 		try {
 			onMessage(JSON.parse(m.data));
@@ -113,6 +126,7 @@ export interface Instance {
 	icon: string;
 	favorite: boolean;
 	group: string;
+	useAikarFlags: boolean;
 }
 
 export interface VanillaVersion {
@@ -420,6 +434,7 @@ export interface InstanceSettings {
 	iconData?: string;
 	favorite?: boolean;
 	group?: string;
+	useAikarFlags?: boolean;
 }
 
 export const updateInstance = (id: string, body: InstanceSettings) =>
@@ -439,6 +454,9 @@ export const launchInstance = (id: string, username: string) =>
 	api<void>(`/instances/${id}/launch`, { method: 'POST', body: JSON.stringify({ username }) });
 
 export const stopInstance = (id: string) => api<void>(`/instances/${id}/stop`, { method: 'POST' });
+
+/** Cancela una instalación/descarga en curso. */
+export const cancelInstall = (id: string) => api<void>(`/instances/${id}/cancel`, { method: 'POST' });
 
 export const deleteInstance = (id: string) => api<void>(`/instances/${id}`, { method: 'DELETE' });
 
@@ -467,10 +485,27 @@ export interface AppSettingsDto {
 	launcherHeight: number;
 	closeToBackground: boolean;
 	minimizeOnLaunch: boolean;
+	maxConcurrentDownloads: number;
+	maxConcurrentWrites: number;
 }
 export const getSettings = () => api<AppSettingsDto>('/settings');
 export const updateSettings = (body: Partial<AppSettingsDto>) =>
 	api<AppSettingsDto>('/settings', { method: 'PATCH', body: JSON.stringify(body) });
+
+/** Purga la caché de la app (metadatos/HTTP). Devuelve los bytes liberados. */
+export const purgeCache = () => api<{ freedBytes: number }>('/cache/purge', { method: 'POST' });
+
+/** Abre la carpeta de logs de la app en el explorador. */
+export const openLogsFolder = () => api<void>('/logs/open', { method: 'POST' });
+
+/** Genera un zip de diagnóstico (logs recientes + ajustes, sin tokens) y devuelve su ruta. */
+export const exportDiagnostics = () => api<{ path: string }>('/logs/export', { method: 'POST' });
+
+/** Relanza la app (botón "Reiniciar ahora"). */
+export async function restartApp(): Promise<void> {
+	const { invoke } = await import('@tauri-apps/api/core');
+	await invoke('restart_app');
+}
 
 // ── Cuentas ──
 export const listAccounts = () => api<Account[]>('/accounts');

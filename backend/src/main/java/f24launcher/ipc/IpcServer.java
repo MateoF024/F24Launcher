@@ -23,6 +23,8 @@ import f24launcher.modpack.ModpackInstaller;
 import f24launcher.modpack.ModpackService;
 import f24launcher.settings.AppSettings;
 import f24launcher.util.AppExecutors;
+import f24launcher.util.HttpConnectionPool;
+import f24launcher.util.LogManager;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -38,6 +40,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 
 /**
  * Servidor IPC local del backend (127.0.0.1, puerto efímero, token de sesión).
@@ -63,13 +67,27 @@ public class IpcServer {
     private final ModpackInstaller modpackInstaller = new ModpackInstaller();
     private final EventBus eventBus = new EventBus();
 
+    // Instalaciones en curso (para cancelarlas). cancelled marca las que el usuario abortó.
+    private final Map<String, Future<?>> installs = new ConcurrentHashMap<>();
+    private final Set<String> cancelled = ConcurrentHashMap.newKeySet();
+
     private Javalin app;
 
     public int start() {
+        // Reconcilia instancias que quedaron marcadas como instaladas pero sin base jugable.
+        instanceManager.reconcileInstalledStates();
+
         app = Javalin.create(cfg -> {
             cfg.showJavalinBanner = false;
+            // Handlers en virtual threads (Java 21): la I/O bloqueante (búsquedas,
+            // identify, updates, descarga del modpack…) ya no agota el pool de Jetty,
+            // así que una operación lenta no congela el resto de la app.
+            cfg.useVirtualThreads = true;
             cfg.bundledPlugins.enableCors(cors -> cors.addRule(rule -> rule.anyHost()));
         });
+
+        // Marca de tiempo para medir la latencia de cada petición (se loguea en after).
+        app.before(ctx -> ctx.attribute("t0", System.nanoTime()));
 
         app.before(ctx -> {
             if (ctx.method() == HandlerType.OPTIONS || "/health".equals(ctx.path())) return;
@@ -94,7 +112,24 @@ public class IpcServer {
         });
 
         registerRoutes();
-        app.after(ctx -> log.info("← {} {}", ctx.path(), ctx.status()));
+
+        // Log de cada petición con método, estado y latencia.
+        app.after(ctx -> {
+            Long t0 = ctx.attribute("t0");
+            long ms = t0 != null ? (System.nanoTime() - t0) / 1_000_000 : -1;
+            log.info("← {} {} {} ({} ms)", ctx.method(), ctx.path(), ctx.status().getCode(), ms);
+        });
+
+        // Manejador global: ningún error de handler queda sin registrar.
+        app.exception(Exception.class, (e, ctx) -> {
+            if (e instanceof io.javalin.http.HttpResponseException hre) {
+                // Respuestas HTTP intencionadas (401/404/…): se respetan, no se "ascienden" a 500.
+                ctx.status(hre.getStatus()).result(hre.getMessage());
+                return;
+            }
+            log.error("Excepción no capturada en {} {}: {}", ctx.method(), ctx.path(), e.getMessage(), e);
+            ctx.status(500).result("error interno");
+        });
 
         app.start("127.0.0.1", 0);
         return app.port();
@@ -153,6 +188,7 @@ public class IpcServer {
                 }
                 if (r.favorite != null) cfg.favorite = r.favorite;
                 if (r.group != null) cfg.group = r.group.trim();
+                if (r.useAikarFlags != null) cfg.useAikarFlags = r.useAikarFlags;
             }
             instanceManager.save(cfg);
             json(ctx, cfg);
@@ -175,7 +211,7 @@ public class IpcServer {
             String id = ctx.pathParam("id");
             InstanceConfig cfg = instanceManager.get(id);
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
-            AppExecutors.io().submit(() -> runInstall(cfg));
+            submitInstall(cfg.id, () -> runInstall(cfg));
             ctx.status(202).result("instalando");
         });
 
@@ -205,6 +241,14 @@ public class IpcServer {
 
         app.post("/instances/{id}/stop", ctx -> {
             gameLauncher.stop(ctx.pathParam("id"));
+            ctx.status(204);
+        });
+
+        // Cancela una instalación en curso (interrumpe descargas; estado → stopped).
+        app.post("/instances/{id}/cancel", ctx -> {
+            String id = ctx.pathParam("id");
+            Future<?> f = installs.get(id);
+            if (f != null) { cancelled.add(id); f.cancel(true); }
             ctx.status(204);
         });
 
@@ -301,6 +345,37 @@ public class IpcServer {
                 instanceManager.migrateInstances(oldInstances, newInstances);
             }
             json(ctx, settingsView());
+        });
+
+        // Purga la caché de la app (metadatos/HTTP). No toca datos de juego.
+        app.post("/cache/purge", ctx -> {
+            Map<String, Object> m = new HashMap<>();
+            m.put("freedBytes", purgeAppCache());
+            json(ctx, m);
+        });
+
+        // Abre la carpeta de logs en el explorador de Windows.
+        app.post("/logs/open", ctx -> {
+            try {
+                new ProcessBuilder("explorer.exe", LogManager.logsDir().toString()).start();
+                ctx.status(204);
+            } catch (Exception e) {
+                log.warn("No se pudo abrir la carpeta de logs: {}", e.getMessage());
+                ctx.status(500).result("No se pudo abrir la carpeta de logs");
+            }
+        });
+
+        // Genera un zip de diagnóstico (logs recientes + ajustes, sin tokens) en logs/.
+        app.post("/logs/export", ctx -> {
+            try {
+                Path zip = exportDiagnostics();
+                Map<String, Object> m = new HashMap<>();
+                m.put("path", zip.toString());
+                json(ctx, m);
+            } catch (Exception e) {
+                log.error("No se pudo exportar el diagnóstico: {}", e.getMessage(), e);
+                ctx.status(500).result(e.getMessage());
+            }
         });
 
         // ── Versiones ──
@@ -529,7 +604,7 @@ public class IpcServer {
             cfg.loaderVersion = "vanilla".equals(loader) ? "" : lv;
             cfg.installed = false;
             instanceManager.save(cfg);
-            AppExecutors.io().submit(() -> runInstall(cfg));
+            submitInstall(cfg.id, () -> runInstall(cfg));
             json(ctx, cfg);
         });
 
@@ -543,9 +618,9 @@ public class IpcServer {
                     contentInstaller.repair(cfg, (phase, d, t) ->
                             eventBus.publish("progress", progressEvent(cfg.id, phase, d, t)));
                     eventBus.publish("state", stateEvent(cfg.id, "installed", null));
-                } catch (Exception e) {
-                    log.error("Error reparando {}: {}", cfg.id, e.getMessage(), e);
-                    eventBus.publish("state", stateEvent(cfg.id, "error", e.getMessage()));
+                } catch (Throwable e) {
+                    log.error("Error reparando {}: {}", cfg.id, msg(e), e);
+                    eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
                 }
             });
             ctx.status(202);
@@ -653,7 +728,7 @@ public class IpcServer {
                 instanceManager.save(cfg);
 
                 final Path pf = packFile;
-                AppExecutors.io().submit(() -> runModpackInstall(cfg, pf, parsed));
+                submitInstall(cfg.id, () -> runModpackInstall(cfg, pf, parsed));
                 json(ctx, cfg);
             } catch (Exception e) {
                 log.error("Error preparando modpack: {}", e.getMessage(), e);
@@ -691,7 +766,7 @@ public class IpcServer {
                 applyF24Meta(cfg, packFile);
                 instanceManager.save(cfg);
                 final Path pf = packFile;
-                AppExecutors.io().submit(() -> runModpackInstall(cfg, pf, parsed));
+                submitInstall(cfg.id, () -> runModpackInstall(cfg, pf, parsed));
                 json(ctx, cfg);
             } catch (Exception e) {
                 log.error("Error importando modpack: {}", e.getMessage(), e);
@@ -726,8 +801,23 @@ public class IpcServer {
     }
 
     /** Descarga la versión y emite progreso/estado por WebSocket. */
+    /** Lanza una instalación cancelable: registra su Future y limpia el estado al terminar. */
+    private void submitInstall(String id, Runnable task) {
+        Future<?> f = AppExecutors.io().submit(() -> {
+            try { task.run(); }
+            finally { installs.remove(id); cancelled.remove(id); }
+        });
+        installs.put(id, f);
+    }
+
+    /** ¿La instalación de esta instancia fue cancelada por el usuario? */
+    private boolean wasCancelled(String id) { return cancelled.contains(id); }
+
     private void runInstall(InstanceConfig cfg) {
+        long t0 = System.nanoTime();
         try {
+            log.info("Instalando instancia {} (MC {} · loader {}). Memoria: {}",
+                    cfg.id, cfg.mcVersion, cfg.loader, LogManager.memoryInfo());
             eventBus.publish("state", stateEvent(cfg.id, "installing", null));
             loaders.install(cfg, (phase, done, total) ->
                     eventBus.publish("progress", progressEvent(cfg.id, phase, done, total)));
@@ -743,16 +833,27 @@ public class IpcServer {
             cfg.installed = true;
             instanceManager.save(cfg);
             eventBus.publish("state", stateEvent(cfg.id, "installed", null));
-            log.info("Instancia {} instalada (MC {}).", cfg.id, cfg.mcVersion);
-        } catch (Exception e) {
-            log.error("Error instalando {}: {}", cfg.id, e.getMessage(), e);
-            eventBus.publish("state", stateEvent(cfg.id, "error", e.getMessage()));
+            log.info("Instancia {} instalada (MC {}) en {} ms. Memoria: {}",
+                    cfg.id, cfg.mcVersion, (System.nanoTime() - t0) / 1_000_000, LogManager.memoryInfo());
+        } catch (Throwable e) {
+            // Throwable (no solo Exception): un Error como OutOfMemoryError debe
+            // reportarse y loguearse, no morir en silencio dejando la UI colgada.
+            if (wasCancelled(cfg.id)) {
+                log.info("Instalación de {} cancelada.", cfg.id);
+                eventBus.publish("state", stateEvent(cfg.id, "stopped", "Instalación cancelada"));
+            } else {
+                log.error("Error instalando {}: {}", cfg.id, msg(e), e);
+                eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
+            }
         }
     }
 
     /** Instala una instancia creada desde un modpack: vanilla+loader, contenido, overrides, Java. */
     private void runModpackInstall(InstanceConfig cfg, Path packFile, ModpackInstaller.Parsed parsed) {
+        long t0 = System.nanoTime();
         try {
+            log.info("Instalando modpack en {} (MC {} · loader {} · {} archivos). Memoria: {}",
+                    cfg.id, cfg.mcVersion, cfg.loader, parsed.files().size(), LogManager.memoryInfo());
             eventBus.publish("state", stateEvent(cfg.id, "installing", null));
             VanillaInstaller.Sink sink = (phase, done, total) ->
                     eventBus.publish("progress", progressEvent(cfg.id, phase, done, total));
@@ -769,10 +870,18 @@ public class IpcServer {
             cfg.installed = true;
             instanceManager.save(cfg);
             eventBus.publish("state", stateEvent(cfg.id, "installed", null));
-            log.info("Modpack instalado en instancia {} (MC {} · {}).", cfg.id, cfg.mcVersion, cfg.loader);
-        } catch (Exception e) {
-            log.error("Error instalando modpack en {}: {}", cfg.id, e.getMessage(), e);
-            eventBus.publish("state", stateEvent(cfg.id, "error", e.getMessage()));
+            log.info("Modpack instalado en instancia {} (MC {} · {}) en {} ms. Memoria: {}",
+                    cfg.id, cfg.mcVersion, cfg.loader, (System.nanoTime() - t0) / 1_000_000, LogManager.memoryInfo());
+        } catch (Throwable e) {
+            // Throwable (no solo Exception): un Error como OutOfMemoryError debe
+            // reportarse y loguearse, no morir en silencio dejando la UI colgada.
+            if (wasCancelled(cfg.id)) {
+                log.info("Instalación de modpack en {} cancelada.", cfg.id);
+                eventBus.publish("state", stateEvent(cfg.id, "stopped", "Instalación cancelada"));
+            } else {
+                log.error("Error instalando modpack en {}: {}", cfg.id, msg(e), e);
+                eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
+            }
         } finally {
             try { Files.deleteIfExists(packFile); } catch (Exception ignored) {}
         }
@@ -793,9 +902,9 @@ public class IpcServer {
             cfg.lastPlayed = System.currentTimeMillis();
             instanceManager.save(cfg);
             eventBus.publish("state", stateEvent(cfg.id, "running", null));
-        } catch (Exception e) {
-            log.error("Error lanzando {}: {}", cfg.id, e.getMessage(), e);
-            eventBus.publish("state", stateEvent(cfg.id, "error", e.getMessage()));
+        } catch (Throwable e) {
+            log.error("Error lanzando {}: {}", cfg.id, msg(e), e);
+            eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
         }
     }
 
@@ -815,6 +924,44 @@ public class IpcServer {
         return m;
     }
 
+    /**
+     * Empaqueta un zip de diagnóstico (logs sueltos de la sesión actual + ajustes) en
+     * la carpeta de logs. No incluye accounts.json (contiene tokens). Devuelve la ruta.
+     */
+    private Path exportDiagnostics() throws java.io.IOException {
+        Path logs = LogManager.logsDir();
+        String ts = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        Path zip = logs.resolve("diagnostico-" + ts + ".zip");
+        Path[] candidates = {
+                logs.resolve(LogManager.BACKEND_LOG),
+                logs.resolve(LogManager.FRONTEND_LOG),
+                LauncherPaths.root().resolve("launcher.json")
+        };
+        try (java.util.zip.ZipOutputStream zos =
+                     new java.util.zip.ZipOutputStream(Files.newOutputStream(zip))) {
+            for (Path f : candidates) {
+                if (Files.isRegularFile(f)) {
+                    zos.putNextEntry(new java.util.zip.ZipEntry(f.getFileName().toString()));
+                    Files.copy(f, zos);
+                    zos.closeEntry();
+                }
+            }
+        }
+        log.info("Diagnóstico exportado a {}", zip);
+        return zip;
+    }
+
+    /** Purga la caché de la app: caché de disco HTTP + metadatos en memoria. Devuelve bytes liberados. */
+    private long purgeAppCache() {
+        HttpConnectionPool http = HttpConnectionPool.getInstance();
+        long freed = http.cacheSize();
+        http.evictCache();
+        http.evictConnections();
+        content.clearCaches();
+        return freed;
+    }
+
     /** Vista serializable de los ajustes globales. */
     private Map<String, Object> settingsView() {
         AppSettings s = AppSettings.getInstance();
@@ -832,6 +979,8 @@ public class IpcServer {
         m.put("launcherHeight", s.getLauncherHeight());
         m.put("closeToBackground", s.isCloseToBackground());
         m.put("minimizeOnLaunch", s.isMinimizeOnLaunch());
+        m.put("maxConcurrentDownloads", s.getMaxConcurrentDownloads());
+        m.put("maxConcurrentWrites", s.getMaxConcurrentWrites());
         return m;
     }
 
@@ -886,6 +1035,12 @@ public class IpcServer {
     }
 
     private static String nz(String s) { return s == null ? "" : s; }
+
+    /** Mensaje legible de un Throwable (un Error como OutOfMemoryError suele traer message null). */
+    private static String msg(Throwable t) {
+        String m = t.getMessage();
+        return (m != null && !m.isBlank()) ? m : t.getClass().getSimpleName();
+    }
 
     /** Aplica los extras de un .f24pack (icono, memoria, jvm, ventana) a la instancia creada. */
     private void applyF24Meta(InstanceConfig cfg, Path packFile) {
@@ -944,7 +1099,7 @@ public class IpcServer {
     private record UpdateReq(String name, Integer minMemoryMb, Integer maxMemoryMb,
                              Integer windowWidth, Integer windowHeight, Boolean fullscreen,
                              String jvmArgs, String javaPathOverride, String iconData,
-                             Boolean favorite, String group) {}
+                             Boolean favorite, String group, Boolean useAikarFlags) {}
     private record SkinReq(String url, String variant) {}
     private record SkinUploadReq(String data, String fileName, String variant) {}
     private record CapeReq(String capeId) {}

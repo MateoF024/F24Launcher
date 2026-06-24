@@ -6,6 +6,7 @@ import f24launcher.core.runtime.JavaRuntimeManager;
 import f24launcher.core.version.MavenCoord;
 import f24launcher.core.version.VanillaInstaller;
 import f24launcher.instance.InstanceConfig;
+import f24launcher.util.DownloadManager;
 import f24launcher.util.HttpConnectionPool;
 
 import com.google.gson.Gson;
@@ -34,6 +35,7 @@ public class ForgeInstaller {
     private static final Logger log = LoggerFactory.getLogger(ForgeInstaller.class);
     private final Gson gson = new Gson();
     private final HttpConnectionPool http = HttpConnectionPool.getInstance();
+    private final DownloadManager dm = DownloadManager.getInstance();
     private final VanillaInstaller vanilla = new VanillaInstaller();
     private final JavaRuntimeManager runtimes = new JavaRuntimeManager();
 
@@ -100,8 +102,10 @@ public class ForgeInstaller {
         Files.createDirectories(installersDir);
         Path installer = installersDir.resolve(cfg.loader + "-" + cfg.mcVersion + "-" + cfg.loaderVersion + "-installer.jar");
         if (!Files.exists(installer) || Files.size(installer) == 0) {
-            byte[] data = http.getBytes(installerUrl(cfg.loader, cfg.mcVersion, cfg.loaderVersion));
-            Files.write(installer, data);
+            DownloadManager.Result r = dm.download(new DownloadManager.Task(
+                    installerUrl(cfg.loader, cfg.mcVersion, cfg.loaderVersion), installer, 0, null, null), false);
+            if (r.status() == DownloadManager.Status.FAILED)
+                throw new Exception("No se pudo descargar el installer de " + cfg.loader, r.error());
         }
 
         try (ZipFile zip = new ZipFile(installer.toFile())) {

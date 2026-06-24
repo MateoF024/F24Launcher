@@ -11,6 +11,7 @@ import {
 	type Account,
 	type AppSettingsDto
 } from './ipc';
+import { flog } from './clientLog';
 
 export interface Progress {
 	phase: string;
@@ -94,19 +95,28 @@ export async function initStore() {
 	await ipcReady;
 	ui.connected = isReady();
 	if (!ui.connected) return;
-	await refreshSettings();
-	await refreshInstances();
-	await refreshAccounts();
-	connect();
-	// Red de seguridad: si el WebSocket pierde algún evento (p. ej. una ráfaga
-	// justo al arrancar), reconciliamos contra el backend cada pocos segundos.
+	connect(); // abre el WebSocket cuanto antes (no perder eventos tempranos)
+	// Carga inicial en paralelo (más rápido que encadenar las tres).
+	await Promise.all([refreshSettings(), refreshInstances(), refreshAccounts()]);
+	// Red de seguridad: si el WebSocket pierde algún evento, reconciliamos contra
+	// el backend — pero solo mientras haya tareas activas (en reposo no hace red).
 	setInterval(reconcile, 3000);
+}
+
+/** ¿Hay alguna tarea activa que justifique reconciliar (instalación/lanzamiento/juego)? */
+function hasActiveWork(): boolean {
+	if (Object.keys(ui.progress).length > 0) return true;
+	for (const s of Object.values(ui.status)) {
+		if (s === 'installing' || s === 'launching' || s === 'running') return true;
+	}
+	return false;
 }
 
 function connect() {
 	ws = events(handleEvent);
 	ws.onclose = () => {
 		ws = null;
+		flog('WARN', 'WebSocket /events cerrado; reintentando en 1.5 s');
 		setTimeout(() => {
 			if (!ws && isReady()) connect();
 		}, 1500);
@@ -115,6 +125,7 @@ function connect() {
 
 /** Sincroniza el estado real del backend y limpia progresos huérfanos. */
 async function reconcile() {
+	if (!hasActiveWork()) return; // en reposo no consultamos al backend (menos CPU/red)
 	try {
 		const fresh = await listInstances();
 		ui.instances = fresh;

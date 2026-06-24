@@ -5,7 +5,7 @@ import f24launcher.core.meta.MojangMeta.*;
 import f24launcher.core.version.MavenCoord;
 import f24launcher.core.version.VanillaInstaller;
 import f24launcher.instance.InstanceConfig;
-import f24launcher.util.HttpConnectionPool;
+import f24launcher.util.DownloadManager;
 
 import com.google.gson.Gson;
 import org.slf4j.Logger;
@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /** Instala y resuelve mod loaders (Fabric/Quilt) fusionando su perfil con la vanilla. */
@@ -21,7 +22,7 @@ public class LoaderInstaller {
 
     private static final Logger log = LoggerFactory.getLogger(LoaderInstaller.class);
     private final Gson gson = new Gson();
-    private final HttpConnectionPool http = HttpConnectionPool.getInstance();
+    private final DownloadManager dm = DownloadManager.getInstance();
     private final VanillaInstaller vanilla = new VanillaInstaller();
     private final LoaderMeta meta = new LoaderMeta();
     private final ForgeInstaller forge = new ForgeInstaller();
@@ -69,22 +70,18 @@ public class LoaderInstaller {
         }
         VersionDetails prof = gson.fromJson(loadProfile(cfg), VersionDetails.class);
         if (prof.libraries == null) return;
-        long total = prof.libraries.size();
-        sink.update(cfg.loader, 0, total);
-        long done = 0;
+        List<DownloadManager.Task> tasks = new ArrayList<>();
         for (Library lib : prof.libraries) {
             synthesizeDownload(lib);
             if (lib.downloads != null && lib.downloads.artifact != null) {
                 Artifact a = lib.downloads.artifact;
-                Path dest = LauncherPaths.library(a.path);
-                if (!Files.exists(dest)) {
-                    byte[] data = http.getBytes(a.url);
-                    Files.createDirectories(dest.getParent());
-                    Files.write(dest, data);
-                }
+                if (a.url != null && !a.url.isBlank())
+                    tasks.add(new DownloadManager.Task(a.url, LauncherPaths.library(a.path), a.size, a.sha1, null));
             }
-            sink.update(cfg.loader, ++done, total);
         }
+        List<DownloadManager.Result> results =
+                dm.downloadAll(tasks, (d, t) -> sink.update(cfg.loader, d, t), false);
+        DownloadManager.requireAllOk(results);
         log.info("Loader {} {} instalado para MC {}.", cfg.loader, cfg.loaderVersion, cfg.mcVersion);
     }
 

@@ -1,9 +1,12 @@
 package f24launcher.util;
 
+import f24launcher.AppVersion;
+
 import okhttp3.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
@@ -11,8 +14,12 @@ public class HttpConnectionPool {
 
     private static final Logger log = LoggerFactory.getLogger(HttpConnectionPool.class);
 
+    // User-Agent identificable (recomendado por Modrinth/CurseForge; reduce rate-limit).
+    private static final String USER_AGENT =
+            "F24Launcher/" + AppVersion.VERSION + " (+https://github.com/MateoF024/F24Launcher)";
+
     private static HttpConnectionPool instance;
-    private final OkHttpClient client;
+    private volatile OkHttpClient client;
 
     private HttpConnectionPool() {
         ConnectionPool pool = new ConnectionPool(20, 5, TimeUnit.MINUTES);
@@ -39,12 +46,39 @@ public class HttpConnectionPool {
         return instance;
     }
 
+    /**
+     * Configura, al arrancar, el dispatcher (alineado con el límite de descargas) y
+     * la caché de disco para metadatos. OkHttp negocia HTTP/2 automáticamente. Las
+     * descargas de archivos llevan {@code Cache-Control: no-store} y no se cachean.
+     */
+    public synchronized void configure(int maxDownloads, File cacheDir, long cacheBytes) {
+        int perHost = Math.max(6, maxDownloads);
+        Dispatcher dispatcher = new Dispatcher();
+        dispatcher.setMaxRequestsPerHost(perHost);
+        dispatcher.setMaxRequests(perHost * 2 + 8);
+
+        // Libera el executor del dispatcher anterior (el del constructor) para no dejarlo
+        // colgando con hilos vivos al reconfigurar al arrancar.
+        java.util.concurrent.ExecutorService oldExec = client.dispatcher().executorService();
+
+        OkHttpClient.Builder b = client.newBuilder().dispatcher(dispatcher);
+        if (cacheDir != null && cacheBytes > 0) {
+            try {
+                b.cache(new Cache(cacheDir, cacheBytes));
+            } catch (Exception e) {
+                log.warn("No se pudo habilitar la caché HTTP: {}", e.getMessage());
+            }
+        }
+        this.client = b.build();
+        oldExec.shutdown();
+        log.info("HTTP: {} req/host · caché de disco {} MB", perHost, cacheBytes / (1024 * 1024));
+    }
+
     public String get(String url) throws IOException {
         Request request = new Request.Builder()
                 .url(url)
-                .addHeader("User-Agent", "F24Launcher/1.0.0")
+                .addHeader("User-Agent", USER_AGENT)
                 .addHeader("Accept", "application/json, */*")
-                .addHeader("Cache-Control", "no-cache")
                 .build();
 
         try (Response response = client.newCall(request).execute()) {
@@ -56,10 +90,31 @@ public class HttpConnectionPool {
         }
     }
 
+    /** POST de un cuerpo JSON; devuelve la respuesta como texto. */
+    public String post(String url, String jsonBody) throws IOException {
+        RequestBody body = RequestBody.create(jsonBody, MediaType.parse("application/json"));
+        Request request = new Request.Builder()
+                .url(url)
+                .addHeader("User-Agent", USER_AGENT)
+                .addHeader("Accept", "application/json")
+                .addHeader("Cache-Control", "no-store")
+                .post(body)
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IOException("HTTP Error " + response.code() + " for POST " + url);
+            }
+            ResponseBody rb = response.body();
+            return rb != null ? rb.string() : "";
+        }
+    }
+
     public byte[] getBytes(String url) throws IOException {
         Request request = new Request.Builder()
                 .url(url)
-                .addHeader("User-Agent", "F24Launcher/1.0.0")
+                .addHeader("User-Agent", USER_AGENT)
+                .addHeader("Cache-Control", "no-store") // no cachear archivos grandes
                 .build();
 
         try (Response response = client.newCall(request).execute()) {
@@ -71,13 +126,13 @@ public class HttpConnectionPool {
         }
     }
 
-    // Fase 3 #16 — Devuelve Response sin cerrar, el caller la maneja con try-with-resources
+    // Devuelve Response sin cerrar; el caller la maneja con try-with-resources.
     public Response getRaw(String url) throws IOException {
         Request request = new Request.Builder()
                 .url(url)
-                .addHeader("User-Agent", "F24Launcher/1.0.0")
+                .addHeader("User-Agent", USER_AGENT)
                 .addHeader("Accept", "*/*")
-                .addHeader("Cache-Control", "no-cache")
+                .addHeader("Cache-Control", "no-store")
                 .build();
 
         Response response = client.newCall(request).execute();
@@ -94,6 +149,24 @@ public class HttpConnectionPool {
 
     public void evictConnections() {
         client.connectionPool().evictAll();
+    }
+
+    /** Vacía la caché de disco HTTP (lo invoca "Purgar caché"). */
+    public void evictCache() {
+        try {
+            Cache c = client.cache();
+            if (c != null) c.evictAll();
+        } catch (IOException ignored) {}
+    }
+
+    /** Tamaño actual de la caché de disco HTTP en bytes (0 si no hay caché). */
+    public long cacheSize() {
+        try {
+            Cache c = client.cache();
+            return c != null ? c.size() : 0;
+        } catch (IOException e) {
+            return 0;
+        }
     }
 
     public void shutdown() {
@@ -116,11 +189,11 @@ public class HttpConnectionPool {
                     if (response.isSuccessful()) {
                         return response;
                     }
-                    // Fase 2 #10 — No reintentar errores de cliente
+                    // No reintentar errores de cliente (4xx).
                     if (response.code() >= 400 && response.code() < 500) {
                         return response;
                     }
-                    // Fase 2 #10 — Cerrar antes de reintentar, evita NPE
+                    // Cerrar antes de reintentar, evita fuga de recursos.
                     response.close();
                     response = null;
                 } catch (IOException e) {

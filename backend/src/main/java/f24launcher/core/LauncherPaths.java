@@ -50,6 +50,11 @@ public final class LauncherPaths {
     public static Path instancesData() { return ensure(root().resolve("instances-data")); }
     public static Path natives()   { return ensure(root().resolve("natives")); }
 
+    /** cache/ — caché de la app (metadatos, http). NO contiene datos de juego. */
+    public static Path cache()     { return ensure(root().resolve("cache")); }
+    /** cache/http — caché de respuestas HTTP/metadatos (purgable desde Ajustes). */
+    public static Path httpCache() { return ensure(cache().resolve("http")); }
+
     /** versions/<id>/<id>.json */
     public static Path versionJson(String id) {
         return ensure(versions().resolve(id)).resolve(id + ".json");
