@@ -10,6 +10,8 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Ajustes globales del launcher (no por instancia): tema, valores por defecto
@@ -21,6 +23,23 @@ public class AppSettings {
     private static final String SETTINGS_FILE = "launcher.json";
     private static final Path SETTINGS_PATH = getSettingsPath();
     private static AppSettings instance;
+
+    /**
+     * Preset Aikar (GC G1 ampliamente probado para Minecraft), sin flags de memoria:
+     * {@code -Xmx} lo deriva el launcher de la memoria máxima de la instancia y
+     * {@code -Xms} queda a cargo del usuario. Es el valor por defecto de
+     * {@link #defaultJvmArgs} y se siembra en cada instancia al crearla.
+     * Ref.: https://docs.papermc.io/paper/aikars-flags
+     */
+    public static final String DEFAULT_AIKAR_JVM_ARGS =
+            "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 "
+            + "-XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch "
+            + "-XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M "
+            + "-XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 "
+            + "-XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 "
+            + "-XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem "
+            + "-XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs "
+            + "-Daikars.new.flags=true";
 
     @Expose private boolean darkMode = true;
     @Expose private boolean showBetaVersions = false;
@@ -34,7 +53,12 @@ public class AppSettings {
     @Expose private int defaultMaxMemoryMb = 4096;
     @Expose private int defaultWindowWidth = 854;
     @Expose private int defaultWindowHeight = 480;
-    @Expose private String defaultJvmArgs = "";
+    @Expose private String defaultJvmArgs = DEFAULT_AIKAR_JVM_ARGS;
+
+    // Grupos para organizar el grid de instancias. Se gestionan en la ventana de
+    // Instancias (no por instancia); aquí se persisten para que puedan existir
+    // grupos vacíos (sin ninguna instancia asignada todavía).
+    @Expose private List<String> groups = new ArrayList<>();
 
     // Tamaño por defecto de la ventana del launcher (16:9).
     @Expose private int launcherWidth = 1440;
@@ -75,7 +99,14 @@ public class AppSettings {
             try (Reader reader = Files.newBufferedReader(SETTINGS_PATH)) {
                 Gson gson = new GsonBuilder().excludeFieldsWithoutExposeAnnotation().create();
                 AppSettings settings = gson.fromJson(reader, AppSettings.class);
-                if (settings != null) return settings;
+                if (settings != null) {
+                    // Migración: si nunca se configuró un JVM por defecto, sembrar el
+                    // preset Aikar (los Aikar flags viven aquí desde la 0.0.4).
+                    if (settings.defaultJvmArgs == null || settings.defaultJvmArgs.isBlank())
+                        settings.defaultJvmArgs = DEFAULT_AIKAR_JVM_ARGS;
+                    if (settings.groups == null) settings.groups = new ArrayList<>();
+                    return settings;
+                }
             } catch (Exception e) {
                 System.err.println("Error cargando configuraciones: " + e.getMessage());
             }
@@ -157,4 +188,26 @@ public class AppSettings {
     public boolean isMinimizeOnLaunch() { return minimizeOnLaunch; }
     public int getMaxConcurrentDownloads() { return maxConcurrentDownloads > 0 ? maxConcurrentDownloads : DownloadManager.defaultLimits()[0]; }
     public int getMaxConcurrentWrites() { return maxConcurrentWrites > 0 ? maxConcurrentWrites : DownloadManager.defaultLimits()[1]; }
+
+    // ── Grupos de instancias ──
+    public synchronized List<String> getGroups() {
+        return groups == null ? new ArrayList<>() : new ArrayList<>(groups);
+    }
+
+    /** Crea un grupo vacío (si no existe ya). Devuelve la lista resultante. */
+    public synchronized List<String> addGroup(String name) {
+        if (groups == null) groups = new ArrayList<>();
+        String n = name == null ? "" : name.trim();
+        if (!n.isEmpty() && groups.stream().noneMatch(g -> g.equalsIgnoreCase(n))) {
+            groups.add(n);
+            save();
+        }
+        return new ArrayList<>(groups);
+    }
+
+    /** Elimina un grupo de la lista persistida (no toca las instancias). */
+    public synchronized void removeGroup(String name) {
+        if (groups == null || name == null) return;
+        if (groups.removeIf(g -> g.equalsIgnoreCase(name.trim()))) save();
+    }
 }

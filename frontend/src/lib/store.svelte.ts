@@ -31,6 +31,7 @@ export const ui = $state({
 	connected: false,
 	instances: [] as Instance[],
 	progress: {} as Record<string, Progress>,
+	contentProgress: {} as Record<string, Progress>, // instanceId → progreso de descarga de contenido (mods)
 	status: {} as Record<string, string>, // instanceId → estado (installing/running/...)
 	logs: {} as Record<string, string[]>, // instanceId → líneas crudas de log en vivo
 	errors: {} as Record<string, string>, // instanceId → último error de instalación/lanzamiento
@@ -153,6 +154,15 @@ function handleEvent(e: { type: string; data: any }) {
 			refreshInstances();
 		}
 		handleWindowOnState(d.instanceId, d.state);
+	} else if (e.type === 'contentProgress') {
+		// Progreso de descarga al instalar/actualizar mods (canal propio, no toca la
+		// barra de instalación de la instancia). Lo consume la vista de la instancia.
+		ui.contentProgress = {
+			...ui.contentProgress,
+			[d.instanceId]: { phase: d.phase, done: d.done, total: d.total }
+		};
+	} else if (e.type === 'crash') {
+		handleCrash(d.instanceId, d.file ?? '');
 	} else if (e.type === 'log') {
 		appendLog(d.instanceId, d.line);
 	} else if (e.type === 'auth') {
@@ -223,6 +233,23 @@ function handleWindowOnState(id: string, state: string) {
 			backgroundedForLaunch = false;
 			restoreToForeground();
 		}
+	}
+}
+
+/**
+ * P8c — al detectar un crash del juego, trae la app al frente y abre la consola de
+ * esa instancia mostrando el crash-report indicado (vía ?crash=). En modo "acceso
+ * directo" no se hace nada: la app se cierra al terminar el juego.
+ */
+async function handleCrash(id: string, file: string) {
+	if (launchModeActive) return;
+	await restoreToForeground();
+	try {
+		const { goto } = await import('$app/navigation');
+		const q = file ? `?crash=${encodeURIComponent(file)}` : '';
+		await goto(`/instance/${id}/console${q}`);
+	} catch {
+		/* fuera de Tauri / navegación no disponible */
 	}
 }
 

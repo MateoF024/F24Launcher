@@ -46,7 +46,7 @@
 		clearContentDrop
 	} from '$lib/store.svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { fade, fly, scale } from 'svelte/transition';
+	import { fade, fly, scale, slide } from 'svelte/transition';
 
 	const id = $derived($page.params.id ?? '');
 	let inst = $state<Instance | null>(null);
@@ -60,6 +60,16 @@
 	let updates = $state<Record<string, UpdateInfo>>({});
 	let updating = $state<Record<string, boolean>>({});
 	let updatingAll = $state(false);
+
+	// P4 — orden de la lista de contenido (se recuerda durante la sesión).
+	type SortKey = 'name' | 'status' | 'added' | 'updated';
+	let sortBy = $state<SortKey>('name');
+	let sortDir = $state<'asc' | 'desc'>('asc');
+
+	// P6 — modal "Actualizar todos".
+	let showUpdateAll = $state(false);
+	let updateSel = $state<Record<string, boolean>>({});
+	let updateProg = $state({ done: 0, total: 0 });
 
 	const activeAccount = $derived(ui.accounts.find((a) => a.active));
 	const runState = $derived(inst ? ui.status[inst.id] : '');
@@ -99,11 +109,40 @@
 		items.reduce<Record<string, number>>((acc, i) => ((acc[i.type] = (acc[i.type] ?? 0) + 1), acc), {})
 	);
 
+	// P4 — lista visible ya ordenada según el criterio elegido.
+	const sorted = $derived.by(() => {
+		const arr = [...visible];
+		const byName = (a: InstalledItem, b: InstalledItem) =>
+			a.name.localeCompare(b.name, 'es', { sensitivity: 'base' });
+		let cmp: (a: InstalledItem, b: InstalledItem) => number;
+		switch (sortBy) {
+			case 'status':
+				cmp = (a, b) => Number(b.enabled) - Number(a.enabled) || byName(a, b);
+				break;
+			case 'added':
+				cmp = (a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0) || byName(a, b);
+				break;
+			case 'updated':
+				cmp = (a, b) => (b.datePublished || '').localeCompare(a.datePublished || '') || byName(a, b);
+				break;
+			default:
+				cmp = byName;
+		}
+		arr.sort(cmp);
+		if (sortDir === 'desc') arr.reverse();
+		return arr;
+	});
+
+	// P6 — elementos con actualización disponible y cuántos hay seleccionados en el modal.
+	const updatableItems = $derived(items.filter((i) => i.projectId && updates[keyOf(i)]));
+	const selectedCount = $derived(updatableItems.filter((it) => updateSel[keyOf(it)]).length);
+
 	function toggleEnv(e: string) {
 		envFilter = envFilter.includes(e) ? envFilter.filter((x) => x !== e) : [...envFilter, e];
 	}
 
 	onMount(async () => {
+		nowTs = Date.now(); // recalcula "desde la última sesión" al entrar
 		await ipcReady;
 		try {
 			inst = await getInstance(id);
@@ -183,10 +222,24 @@
 		}
 	}
 
-	async function updateAll() {
+	// P6 — abre el modal de confirmación con todas las actualizaciones marcadas.
+	function openUpdateAll() {
+		updateSel = Object.fromEntries(updatableItems.map((it) => [keyOf(it), true]));
+		updateProg = { done: 0, total: 0 };
+		showUpdateAll = true;
+	}
+
+	// Actualiza solo los elementos marcados; muestra el avance (P9) por el contador.
+	async function confirmUpdateAll() {
+		const sel = updatableItems.filter((it) => updateSel[keyOf(it)]);
+		if (!sel.length) {
+			showUpdateAll = false;
+			return;
+		}
 		updatingAll = true;
+		updateProg = { done: 0, total: sel.length };
 		try {
-			for (const it of items) {
+			for (const it of sel) {
 				const u = updates[keyOf(it)];
 				if (u && it.projectId) {
 					await installContent(id, {
@@ -197,10 +250,12 @@
 						ignore: true
 					});
 				}
+				updateProg = { ...updateProg, done: updateProg.done + 1 };
 			}
 			await refresh();
 		} finally {
 			updatingAll = false;
+			showUpdateAll = false;
 		}
 	}
 
@@ -249,22 +304,56 @@
 		}
 	}
 
+	// ── Menú "⋮" de la cabecera y estadísticas de tiempo (P1/P5) ──
+	let menuOpen = $state(false);
+	function runMenu(fn: () => void) {
+		menuOpen = false;
+		fn();
+	}
+
+	// Instante en que se abrió la instancia: el "desde la última sesión" se calcula
+	// contra este momento (se refresca en onMount cada vez que se entra a la instancia).
+	let nowTs = $state(Date.now());
+
+	const totalPlayLabel = $derived(inst ? fmtHours(inst.totalPlayMs ?? 0) : '');
+	const lastSessionLabel = $derived(
+		inst && inst.lastPlayed > 0 ? fmtSince(inst.lastPlayed, nowTs) : ''
+	);
+
+	/** Tiempo de juego total, siempre en horas (p. ej. "12 h", "0,5 h"). */
+	function fmtHours(ms: number): string {
+		const h = ms / 3_600_000;
+		if (h <= 0) return '0 h';
+		const s = h >= 10 ? Math.round(h).toString() : h.toFixed(1);
+		return s.replace('.', ',') + ' h';
+	}
+
+	/** Tiempo transcurrido desde {@code ts} en la unidad que corresponda (s/min/h/d). */
+	function fmtSince(ts: number, now: number): string {
+		const sec = Math.max(0, Math.floor((now - ts) / 1000));
+		if (sec < 60) return `hace ${sec} s`;
+		const min = Math.floor(sec / 60);
+		if (min < 60) return `hace ${min} min`;
+		const hrs = Math.floor(min / 60);
+		if (hrs < 24) return `hace ${hrs} h`;
+		const days = Math.floor(hrs / 24);
+		return `hace ${days} ${days === 1 ? 'día' : 'días'}`;
+	}
+
 	// ── Ajustes de la instancia ──
 	let showSettings = $state(false);
+	let settingsAdvOpen = $state(false); // "Opciones avanzadas" (cerrado por defecto)
 	let savingSettings = $state(false);
 	// editIcon: null = sin cambios · '' = quitar · data-URL = nuevo icono.
 	let editIcon = $state<string | null>(null);
 	let form = $state({
 		name: '',
-		group: '',
-		minMemoryMb: 1024,
 		maxMemoryMb: 4096,
 		windowWidth: 1280,
 		windowHeight: 720,
 		fullscreen: false,
 		jvmArgs: '',
-		javaPathOverride: '',
-		useAikarFlags: true
+		javaPathOverride: ''
 	});
 
 	// ── Cambio de versión / loader de la instancia ──
@@ -284,6 +373,13 @@
 				verForm.loaderVersion !== (inst.loaderVersion ?? ''))
 	);
 	const verReady = $derived(verForm.loader === 'vanilla' || !!verForm.loaderVersion);
+	// P13: al editar, respetar "Mostrar versiones beta"; pero conservar siempre la
+	// versión actual de la instancia aunque sea snapshot/beta (para no perderla del selector).
+	const mcVersionsShown = $derived(
+		ui.settings?.showBetaVersions
+			? mcVersions
+			: mcVersions.filter((v) => v.type === 'release' || v.id === inst?.mcVersion)
+	);
 	const compatCounts = $derived.by(() => {
 		const c = { compatible: 0, updatable: 0, incompatible: 0, unknown: 0 };
 		for (const it of compatReport ?? []) c[it.status]++;
@@ -313,16 +409,14 @@
 		if (!inst) return;
 		form = {
 			name: inst.name,
-			group: inst.group ?? '',
-			minMemoryMb: inst.minMemoryMb,
 			maxMemoryMb: inst.maxMemoryMb,
 			windowWidth: inst.windowWidth,
 			windowHeight: inst.windowHeight,
 			fullscreen: inst.fullscreen,
 			jvmArgs: inst.jvmArgs ?? '',
-			javaPathOverride: inst.javaPathOverride ?? '',
-			useAikarFlags: inst.useAikarFlags ?? true
+			javaPathOverride: inst.javaPathOverride ?? ''
 		};
+		settingsAdvOpen = false;
 		editIcon = null;
 		verForm = { mcVersion: inst.mcVersion, loader: inst.loader, loaderVersion: inst.loaderVersion ?? '' };
 		compatReport = null;
@@ -537,9 +631,6 @@
 		setTimeout(() => (shortcutMsg = ''), 4000);
 	}
 
-	// Grupos existentes (para el datalist del campo de grupo en Ajustes).
-	const groupNames = $derived([...new Set(ui.instances.map((i) => i.group).filter(Boolean))]);
-
 	function pickSettingsIcon() {
 		const input = document.createElement('input');
 		input.type = 'file';
@@ -624,6 +715,8 @@
 	}
 </script>
 
+<svelte:window onclick={() => (menuOpen = false)} />
+
 <header>
 	<button class="ghost back" title="Volver" onclick={() => goto('/')}><Icon name="arrow-left" size={16} /></button>
 	{#if inst?.icon}
@@ -639,24 +732,43 @@
 				{inst.loaderVersion} · MC {inst.mcVersion}
 			{/if}
 		</div>
+		{#if inst}
+			<div class="dim playstats">
+				<Icon name="clock" size={12} /><span>{totalPlayLabel}</span>
+				{#if lastSessionLabel}<span class="sep">·</span><span>Última sesión {lastSessionLabel}</span>{/if}
+			</div>
+		{/if}
 	</div>
 	<div class="spacer"></div>
 	{#if inst}
 		<button class="ghost gear" title="Consola de la instancia" onclick={() => goto(`/instance/${id}/console`)}>
 			<Icon name="terminal" size={15} />Consola
 		</button>
-		<button class="ghost gear" title="Abrir carpeta de la instancia" onclick={() => openInstanceFolder(inst!.id)}>
-			<Icon name="folder" size={15} />Carpeta
-		</button>
-		<button class="ghost gear" title="Exportar instancia (.f24pack / .mrpack)" onclick={openExport}>
-			<Icon name="package" size={15} />Exportar
-		</button>
-		<button class="ghost gear" title="Crear acceso directo en el escritorio" onclick={createShortcut}>
-			<Icon name="external" size={15} />Acceso directo
-		</button>
-		<button class="ghost gear" title="Verificar y reparar archivos" onclick={repair}>
-			<Icon name="wrench" size={15} />Reparar
-		</button>
+		<div class="menuwrap">
+			<button
+				class="ghost gear menubtn"
+				class:active={menuOpen}
+				title="Más acciones"
+				aria-haspopup="menu"
+				aria-expanded={menuOpen}
+				onclick={(e) => { e.stopPropagation(); menuOpen = !menuOpen; }}
+			>
+				<Icon name="more" size={16} />
+			</button>
+			{#if menuOpen}
+				<div class="menu" transition:scale={{ start: 0.95, duration: 130 }}>
+					<button onclick={() => runMenu(() => openInstanceFolder(inst!.id))}>
+						<Icon name="folder" size={15} />Carpeta
+					</button>
+					<button onclick={() => runMenu(openExport)}>
+						<Icon name="export" size={15} />Exportar
+					</button>
+					<button onclick={() => runMenu(createShortcut)}>
+						<Icon name="external" size={15} />Acceso directo
+					</button>
+				</div>
+			{/if}
+		</div>
 		<button class="ghost gear" title="Ajustes de la instancia" onclick={openSettings}>
 			<Icon name="gear" size={15} />Ajustes
 		</button>
@@ -687,7 +799,7 @@
 <div class="toolbar">
 	<input class="search" placeholder="Buscar en {items.length} elementos…" bind:value={query} />
 	{#if updateCount > 0}
-		<button class="upd" disabled={updatingAll} onclick={updateAll}>
+		<button class="upd" disabled={updatingAll} onclick={openUpdateAll}>
 			{updatingAll ? 'Actualizando…' : `Actualizar todos (${updateCount})`}
 		</button>
 	{/if}
@@ -731,6 +843,23 @@
 			{/if}
 		</div>
 	{/if}
+	<div class="fgroup ordergroup">
+		<span class="flabel"><Icon name="sort" size={13} />Orden</span>
+		<select class="catsel" bind:value={sortBy}>
+			<option value="name">Nombre (A-Z)</option>
+			<option value="status">Estado</option>
+			<option value="added">Fecha agregado</option>
+			<option value="updated">Actualizados recientemente</option>
+		</select>
+		<button
+			class="fchip dirbtn"
+			class:active={sortDir === 'desc'}
+			title={sortDir === 'asc' ? 'Invertir orden' : 'Invertir orden (descendente)'}
+			onclick={() => (sortDir = sortDir === 'asc' ? 'desc' : 'asc')}
+		>
+			<Icon name="updown" size={14} />
+		</button>
+	</div>
 </div>
 
 {#if loading}
@@ -742,7 +871,7 @@
 	</div>
 {:else}
 	<div class="list">
-		{#each visible as it (it.type + '/' + it.fileName)}
+		{#each sorted as it (it.type + '/' + it.fileName)}
 			<div
 				class="item"
 				in:fade={{ duration: 160 }}
@@ -766,7 +895,11 @@
 						{#if it.source}<span class="tag src">{it.source}</span>{/if}
 					</div>
 					<div class="dim small">
-						{it.versionName || it.fileName}{it.author ? ` · ${it.author}` : ''}
+						{#if updating[keyOf(it)] && ui.contentProgress[id]}
+							<span class="updphase">{ui.contentProgress[id].phase}…</span>
+						{:else}
+							{it.versionName || it.fileName}{it.author ? ` · ${it.author}` : ''}
+						{/if}
 					</div>
 				</div>
 				<div class="actions">
@@ -801,6 +934,64 @@
 				</div>
 			</div>
 		{/each}
+	</div>
+{/if}
+
+{#if showUpdateAll}
+	<div
+		class="overlay"
+		onclick={() => !updatingAll && (showUpdateAll = false)}
+		role="presentation"
+		transition:fade={{ duration: 130 }}
+	>
+		<div
+			class="modal updmodal"
+			onclick={(e) => e.stopPropagation()}
+			role="dialog"
+			tabindex="-1"
+			transition:scale={{ start: 0.96, duration: 170 }}
+		>
+			<h2>Actualizar contenido</h2>
+			{#if updatableItems.length === 0}
+				<p class="dim">No hay actualizaciones disponibles.</p>
+			{:else if updatingAll}
+				<div class="updprog">
+					<div class="hbar">
+						<div
+							class="hfill"
+							style="width:{updateProg.total ? Math.round((updateProg.done / updateProg.total) * 100) : 0}%"
+						></div>
+					</div>
+					<p class="dim small">
+						Actualizando {updateProg.done} de {updateProg.total}…{#if ui.contentProgress[id]}
+							· {ui.contentProgress[id].phase}{/if}
+					</p>
+				</div>
+			{:else}
+				<p class="dim small">
+					Se actualizarán los elementos marcados. Desmarca los que quieras conservar.
+				</p>
+				<div class="updlist">
+					{#each updatableItems as it (keyOf(it))}
+						<label class="updrow">
+							<input type="checkbox" bind:checked={updateSel[keyOf(it)]} />
+							<div class="updinfo">
+								<span class="nm">{it.name}</span>
+								<span class="dim small">{it.versionName} → {updates[keyOf(it)].versionName}</span>
+							</div>
+						</label>
+					{/each}
+				</div>
+			{/if}
+			<div class="modal-actions">
+				<button class="ghost" onclick={() => (showUpdateAll = false)} disabled={updatingAll}>Cancelar</button>
+				{#if updatableItems.length > 0}
+					<button onclick={confirmUpdateAll} disabled={updatingAll || selectedCount === 0}>
+						{updatingAll ? 'Actualizando…' : `Actualizar (${selectedCount})`}
+					</button>
+				{/if}
+			</div>
+		</div>
 	</div>
 {/if}
 
@@ -873,67 +1064,14 @@
 					Nombre
 					<input bind:value={form.name} />
 				</label>
-
-				<label class="full">
-					Grupo <span class="dim">(para organizar el grid)</span>
-					<input list="f24-groups" bind:value={form.group} placeholder="Sin grupo" />
-				</label>
-				<datalist id="f24-groups">
-					{#each groupNames as g}<option value={g}></option>{/each}
-				</datalist>
-
-				<label class="full">
-					Memoria máxima · <strong>{form.maxMemoryMb} MB</strong>
-					<input
-						type="range"
-						min="1024"
-						max="16384"
-						step="512"
-						bind:value={form.maxMemoryMb}
-					/>
-				</label>
-
-				<label>
-					Memoria mínima (MB)
-					<input type="number" min="256" max="16384" step="256" bind:value={form.minMemoryMb} />
-				</label>
-				<label class="chk">
-					<input type="checkbox" bind:checked={form.fullscreen} />
-					Pantalla completa
-				</label>
-
-				<label>
-					Ancho
-					<input type="number" min="640" step="1" bind:value={form.windowWidth} disabled={form.fullscreen} />
-				</label>
-				<label>
-					Alto
-					<input type="number" min="480" step="1" bind:value={form.windowHeight} disabled={form.fullscreen} />
-				</label>
-
-				<label class="full chk">
-					<input type="checkbox" bind:checked={form.useAikarFlags} />
-					Usar Aikar flags (preset de GC recomendado para Minecraft)
-				</label>
-
-				<label class="full">
-					Argumentos JVM extra
-					<textarea rows="2" placeholder="-XX:+UseG1GC …" bind:value={form.jvmArgs}></textarea>
-				</label>
-
-				<label class="full">
-					Ruta de Java (JRE) — vacío = automático
-					<input placeholder="C:\\…\\bin\\javaw.exe" bind:value={form.javaPathOverride} />
-				</label>
 			</div>
 
 			<div class="versec">
-				<div class="vshead"><Icon name="swap" size={15} /><span>Versión y loader</span></div>
 				<div class="vsgrid">
 					<label>
 						Minecraft
 						<select bind:value={verForm.mcVersion} onchange={() => loadVerLoaderVersions()}>
-							{#each mcVersions as v (v.id)}<option value={v.id}>{v.id}</option>{/each}
+							{#each mcVersionsShown as v (v.id)}<option value={v.id}>{v.id}</option>{/each}
 						</select>
 					</label>
 					<label>
@@ -1013,6 +1151,44 @@
 					</div>
 				{/if}
 			</div>
+
+			<button type="button" class="advtoggle" onclick={() => (settingsAdvOpen = !settingsAdvOpen)}>
+				<Icon name="sliders" size={14} />Opciones avanzadas
+				<Icon name={settingsAdvOpen ? 'chevron-down' : 'chevron-right'} size={14} />
+			</button>
+			{#if settingsAdvOpen}
+				<div class="sgrid sadv" transition:slide={{ duration: 160 }}>
+					<label class="full">
+						Memoria máxima · <strong>{form.maxMemoryMb} MB</strong>
+						<input type="range" min="1024" max="16384" step="512" bind:value={form.maxMemoryMb} />
+					</label>
+					<label>
+						Ancho
+						<input type="number" min="640" step="1" bind:value={form.windowWidth} disabled={form.fullscreen} />
+					</label>
+					<label>
+						Alto
+						<input type="number" min="480" step="1" bind:value={form.windowHeight} disabled={form.fullscreen} />
+					</label>
+					<label class="full chk">
+						<input type="checkbox" bind:checked={form.fullscreen} />
+						Pantalla completa
+					</label>
+					<label class="full">
+						JVM
+						<input placeholder="-XX:+UseG1GC …" bind:value={form.jvmArgs} />
+					</label>
+					<label class="full">
+						Ruta de Java (JRE) — vacío = automático
+						<input placeholder="C:\\…\\bin\\javaw.exe" bind:value={form.javaPathOverride} />
+					</label>
+					<div class="full repairrow">
+						<button type="button" class="ghost" onclick={repair}>
+							<Icon name="wrench" size={14} />Verificar y reparar archivos
+						</button>
+					</div>
+				</div>
+			{/if}
 
 			<div class="modal-actions">
 				<button class="ghost dup" onclick={duplicate} disabled={duplicating}>
@@ -1164,6 +1340,61 @@
 		margin-top: 2px;
 		text-transform: capitalize;
 	}
+	.playstats {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		font-size: 12px;
+		margin-top: 3px;
+	}
+	.playstats .sep {
+		opacity: 0.55;
+	}
+	/* Menú "⋮" de la cabecera */
+	.menuwrap {
+		position: relative;
+		display: inline-flex;
+	}
+	.menubtn {
+		padding: 9px 11px;
+	}
+	.menubtn.active {
+		background: var(--bg-elev);
+		color: var(--text);
+	}
+	.menu {
+		position: absolute;
+		top: calc(100% + 6px);
+		right: 0;
+		z-index: 30;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		padding: 6px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 168px;
+		box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+		transform-origin: top right;
+	}
+	.menu button {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		justify-content: flex-start;
+		background: transparent;
+		border: none;
+		color: var(--text);
+		padding: 8px 10px;
+		border-radius: 7px;
+		font-size: 13px;
+		width: 100%;
+		text-align: left;
+	}
+	.menu button:hover {
+		background: var(--bg-card);
+	}
 	.spacer {
 		flex: 1;
 	}
@@ -1251,8 +1482,10 @@
 	}
 	.filterbar {
 		display: flex;
-		flex-direction: column;
-		gap: 8px;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 20px;
 		margin-bottom: 16px;
 	}
 	.fgroup {
@@ -1333,11 +1566,11 @@
 	.item {
 		display: flex;
 		align-items: center;
-		gap: 13px;
+		gap: 15px;
 		background: var(--bg-card);
 		border: 1px solid var(--border);
 		border-radius: var(--radius);
-		padding: 11px 14px;
+		padding: 14px 16px;
 	}
 	.item.off {
 		opacity: 0.5;
@@ -1353,9 +1586,9 @@
 		color: var(--accent);
 	}
 	.icon {
-		width: 42px;
-		height: 42px;
-		border-radius: 9px;
+		width: 48px;
+		height: 48px;
+		border-radius: 10px;
 		object-fit: cover;
 		background: var(--bg-elev);
 		flex-shrink: 0;
@@ -1487,6 +1720,7 @@
 	}
 	.modal.settings {
 		width: 520px;
+		overflow-y: auto;
 	}
 	.iconpick {
 		display: flex;
@@ -1550,24 +1784,16 @@
 	}
 	.hfill {
 		height: 100%;
-		background: var(--accent);
+		background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--accent-dim));
+		background-size: 200% 100%;
+		animation: f24-bar-shine 1.8s linear infinite;
 		transition: width 0.2s ease;
 	}
 	/* Sección de cambio de versión / loader */
 	.versec {
-		border-top: 1px solid var(--border);
-		padding-top: 14px;
 		display: flex;
 		flex-direction: column;
 		gap: 12px;
-	}
-	.vshead {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--text);
 	}
 	.vsgrid {
 		display: grid;
@@ -1765,7 +1991,6 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 14px;
-		overflow: auto;
 	}
 	.sgrid label {
 		display: flex;
@@ -1803,5 +2028,83 @@
 	}
 	.sgrid input:disabled {
 		opacity: 0.5;
+	}
+	/* "Opciones avanzadas" plegable dentro de Ajustes */
+	.advtoggle {
+		background: var(--bg-card);
+		color: var(--text);
+		border: 1px solid var(--border);
+		justify-content: flex-start;
+		gap: 8px;
+		font-size: 13px;
+		padding: 9px 12px;
+	}
+	.advtoggle:hover {
+		background: var(--bg-elev);
+	}
+	.advtoggle :global(.icon:last-child) {
+		margin-left: auto;
+	}
+	.sadv {
+		margin-top: 2px;
+	}
+	.repairrow {
+		display: flex;
+		justify-content: flex-start;
+	}
+	/* P4 — selector de orden */
+	.ordergroup .flabel {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.dirbtn {
+		padding: 5px 8px;
+	}
+	/* P6 — modal "Actualizar contenido" */
+	.updmodal {
+		width: 480px;
+	}
+	.updlist {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		overflow: auto;
+		max-height: 46vh;
+	}
+	.updrow {
+		display: flex;
+		align-items: center;
+		gap: 11px;
+		background: var(--bg-card);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 8px 12px;
+		cursor: pointer;
+		transition: border-color 0.15s ease;
+	}
+	.updrow:hover {
+		border-color: var(--accent-dim);
+	}
+	.updrow input[type='checkbox'] {
+		accent-color: var(--accent);
+		width: 16px;
+		height: 16px;
+		flex-shrink: 0;
+	}
+	.updinfo {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+	.updprog {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 8px 0;
+	}
+	.updphase {
+		color: var(--accent);
 	}
 </style>

@@ -73,6 +73,10 @@ button:active:not(:disabled) {
 	transform: translateY(1px);
 }
 
+button:disabled {
+	cursor: not-allowed;
+}
+
 button.ghost {
 	background: var(--bg-card);
 	color: var(--text);
@@ -83,8 +87,27 @@ button.ghost:hover {
 	background: var(--bg-elev);
 }
 
+/* Foco por teclado consistente en todos los controles (pulido + accesibilidad). */
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[role='button']:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+
 a {
 	color: var(--accent);
+}
+
+/* Barras de progreso "vivas": un brillo que recorre el relleno mientras descarga.
+   Las barras usan esta animación aplicando la clase a su relleno. */
+@keyframes f24-bar-shine {
+	to {
+		background-position: -200% 0;
+	}
 }
 
 /* Scrollbars finas y acordes al tema. */

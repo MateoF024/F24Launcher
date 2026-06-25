@@ -34,15 +34,22 @@ public class ContentInstaller {
     /** Instala un proyecto (versión concreta o la mejor compatible) y sus dependencias requeridas. */
     public InstalledItem install(InstanceConfig cfg, String source, ContentType type,
                                  String projectId, String versionId, boolean ignoreFilters) throws Exception {
+        return install(cfg, source, type, projectId, versionId, ignoreFilters, (p, d, t) -> {});
+    }
+
+    /** Igual que {@link #install}, reportando el progreso de descarga por el sink (P9). */
+    public InstalledItem install(InstanceConfig cfg, String source, ContentType type,
+                                 String projectId, String versionId, boolean ignoreFilters,
+                                 VanillaInstaller.Sink sink) throws Exception {
         ContentManifest manifest = ContentManifest.load(cfg.id);
-        InstalledItem item = installInto(cfg, source, type, projectId, versionId, ignoreFilters, manifest, new HashSet<>());
+        InstalledItem item = installInto(cfg, source, type, projectId, versionId, ignoreFilters, manifest, new HashSet<>(), sink);
         manifest.save(cfg.id);
         return item;
     }
 
     private InstalledItem installInto(InstanceConfig cfg, String source, ContentType type, String projectId,
                                       String versionId, boolean ignoreFilters, ContentManifest manifest,
-                                      Set<String> visited) throws Exception {
+                                      Set<String> visited, VanillaInstaller.Sink sink) throws Exception {
         String key = source + ":" + projectId + ":" + type.id;
         if (!visited.add(key)) return null;
 
@@ -52,6 +59,7 @@ public class ContentInstaller {
         Path dir = folder(cfg, type);
         Files.createDirectories(dir);
         Path dest = dir.resolve(sanitize(version.fileName()));
+        sink.update("Descargando " + version.fileName(), 0, 1);
         byte[] data = HttpConnectionPool.getInstance().getBytes(version.downloadUrl());
         String sha1 = hex(data, "SHA-1");
         ObjectStore.linkWrite(dest, data, sha1); // dedup: store + hardlink (cae a copia atómica si no se puede)
@@ -73,24 +81,27 @@ public class ContentInstaller {
         e.categories = meta != null ? meta.categories() : new ArrayList<>();
         e.clientSide = meta != null ? meta.clientSide() : "";
         e.serverSide = meta != null ? meta.serverSide() : "";
+        if (e.addedAt == 0) e.addedAt = System.currentTimeMillis(); // se conserva al actualizar
+        e.datePublished = version.datePublished() != null ? version.datePublished() : "";
         e.downloadUrl = version.downloadUrl();
         e.fileSize = data.length;
         e.sha1 = sha1;
         e.sha512 = hex(data, "SHA-512");
+        sink.update("Instalado " + e.name, 1, 1);
 
         // Dependencias requeridas (se tratan como mods).
         for (Dependency dep : version.dependencies()) {
             if (!"required".equalsIgnoreCase(dep.type())) continue;
             if (manifest.find(source, dep.projectId(), ContentType.MODS.id) != null) continue;
             try {
-                installInto(cfg, source, ContentType.MODS, dep.projectId(), null, ignoreFilters, manifest, visited);
+                installInto(cfg, source, ContentType.MODS, dep.projectId(), null, ignoreFilters, manifest, visited, sink);
             } catch (Exception ex) {
                 log.warn("No se pudo instalar dependencia {}: {}", dep.projectId(), ex.getMessage());
             }
         }
 
         log.info("Instalado {} ({}) en {}", e.name, version.versionNumber(), cfg.id);
-        return toItem(e);
+        return toItem(cfg, e);
     }
 
     private Version resolve(String source, ContentType type, String projectId, String versionId,
@@ -131,7 +142,7 @@ public class ContentInstaller {
     public List<InstalledItem> list(InstanceConfig cfg) {
         ContentManifest manifest = ContentManifest.load(cfg.id);
         Map<String, InstalledItem> byBase = new LinkedHashMap<>();
-        for (ContentManifest.Entry e : manifest.items) byBase.put(baseKey(e.type, e.fileName), toItem(e));
+        for (ContentManifest.Entry e : manifest.items) byBase.put(baseKey(e.type, e.fileName), toItem(cfg, e));
 
         for (ContentType type : ContentType.values()) {
             Path dir = folder(cfg, type);
@@ -144,7 +155,7 @@ public class ContentInstaller {
                     if (byBase.containsKey(k)) return;
                     boolean enabled = !fn.endsWith(".disabled");
                     byBase.put(k, new InstalledItem(fn, type.id, enabled, "", "", "", fn, "", "", "", "",
-                            List.of(), "", ""));
+                            List.of(), "", "", fileMtime(p), ""));
                 });
             } catch (Exception ignored) {}
         }
@@ -173,7 +184,7 @@ public class ContentInstaller {
                     try {
                         byte[] data = Files.readAllBytes(p);
                         pending.add(new Pending(type, fn, hex(data, "SHA-1"),
-                                Murmur2.curseForgeFingerprint(data), data.length));
+                                Murmur2.curseForgeFingerprint(data), data.length, fileMtime(p)));
                     } catch (Exception ex) {
                         log.debug("No se pudo leer {}: {}", fn, ex.getMessage());
                     }
@@ -206,15 +217,15 @@ public class ContentInstaller {
                     fillExport(e, m.downloadUrl(), p.sha1(), "", p.size());
                 }
             }
-            if (e != null) { manifest.items.add(e); identified++; }
+            if (e != null) { e.addedAt = p.mtime() > 0 ? p.mtime() : System.currentTimeMillis(); manifest.items.add(e); identified++; }
         }
         if (identified > 0) manifest.save(cfg.id);
         log.info("identify {}: {} identificado(s) en {} ms", cfg.id, identified, (System.nanoTime() - t0) / 1_000_000);
         return list(cfg);
     }
 
-    /** Archivo pendiente de identificar: tipo, nombre, sha1, fingerprint CF y tamaño. */
-    private record Pending(ContentType type, String fileName, String sha1, long fingerprint, long size) {}
+    /** Archivo pendiente de identificar: tipo, nombre, sha1, fingerprint CF, tamaño y mtime. */
+    private record Pending(ContentType type, String fileName, String sha1, long fingerprint, long size, long mtime) {}
 
     /** Rellena los datos de reparación/export (downloadUrl + hashes + tamaño) de un mod identificado. */
     private void fillExport(ContentManifest.Entry e, String downloadUrl, String sha1, String sha512, long size) {
@@ -408,12 +419,24 @@ public class ContentInstaller {
         return best;
     }
 
-    private InstalledItem toItem(ContentManifest.Entry e) {
+    private InstalledItem toItem(InstanceConfig cfg, ContentManifest.Entry e) {
         boolean enabled = !e.fileName.endsWith(".disabled");
+        long addedAt = e.addedAt > 0 ? e.addedAt
+                : fileMtime(folder(cfg, ContentType.from(e.type)).resolve(e.fileName));
         return new InstalledItem(e.fileName, e.type, enabled, e.source, e.projectId, e.slug,
                 e.name, e.iconUrl, e.author, e.versionId, e.versionName,
                 e.categories != null ? e.categories : List.of(),
-                e.clientSide != null ? e.clientSide : "", e.serverSide != null ? e.serverSide : "");
+                e.clientSide != null ? e.clientSide : "", e.serverSide != null ? e.serverSide : "",
+                addedAt, e.datePublished != null ? e.datePublished : "");
+    }
+
+    /** Fecha de modificación del archivo (epoch ms), o 0 si no se puede leer. */
+    private static long fileMtime(Path p) {
+        try {
+            return Files.getLastModifiedTime(p).toMillis();
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     private ProjectDetail safeDetail(String source, ContentType type, String projectId) {

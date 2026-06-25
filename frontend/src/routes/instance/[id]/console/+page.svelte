@@ -2,13 +2,25 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
-	import { ipcReady, getInstance, getInstanceLog, type Instance } from '$lib/ipc';
+	import {
+		ipcReady,
+		getInstance,
+		getInstanceLog,
+		listInstanceLogs,
+		openInstanceLogs,
+		type Instance,
+		type InstanceLogFile
+	} from '$lib/ipc';
 	import { ui } from '$lib/store.svelte';
 	import { processLog, type LogLevel } from '$lib/log';
 	import Icon from '$lib/Icon.svelte';
 
+	const LATEST = 'logs/latest.log';
+
 	const id = $derived($page.params.id ?? '');
 	let inst = $state<Instance | null>(null);
+	let logFiles = $state<InstanceLogFile[]>([]);
+	let selectedFile = $state(LATEST);
 	let fileLines = $state<string[]>([]);
 	let loadingFile = $state(false);
 
@@ -19,8 +31,9 @@
 	const running = $derived(ui.status[id] === 'running' || ui.status[id] === 'launching');
 	const liveLines = $derived(ui.logs[id] ?? []);
 
-	// En ejecución → log en vivo; si no → último latest.log del disco.
-	const rawLines = $derived(running ? liveLines : fileLines);
+	// Hay log en vivo cuando la instancia corre y se mira su latest.log; si no, disco.
+	const isLive = $derived(running && selectedFile === LATEST);
+	const rawLines = $derived(isLive ? liveLines : fileLines);
 	const lines = $derived(processLog(rawLines));
 	const shown = $derived(filter === 'all' ? lines : lines.filter((l) => l.level === filter));
 
@@ -29,14 +42,48 @@
 		error: lines.filter((l) => l.level === 'error' || l.level === 'fatal').length
 	});
 
+	// Crash-report indicado por la navegación automática tras un crash (?crash=).
+	const crashParam = $derived($page.url.searchParams.get('crash') ?? '');
+
+	async function loadLogList() {
+		try {
+			logFiles = await listInstanceLogs(id);
+		} catch {
+			logFiles = [];
+		}
+	}
+
 	async function loadFile() {
+		if (isLive) {
+			fileLines = [];
+			return;
+		}
 		loadingFile = true;
 		try {
-			fileLines = await getInstanceLog(id);
+			fileLines = await getInstanceLog(id, selectedFile);
 		} catch {
 			fileLines = [];
 		} finally {
 			loadingFile = false;
+		}
+	}
+
+	function selectFile(path: string) {
+		selectedFile = path;
+		stick = true;
+		loadFile();
+	}
+
+	function optLabel(f: InstanceLogFile): string {
+		if (f.path === LATEST) return running ? 'latest.log (en vivo)' : 'latest.log';
+		return f.crash ? `${f.name} · crash` : f.name;
+	}
+
+	async function openLogs() {
+		try {
+			await openInstanceLogs(id);
+		} catch {
+			/* ignore */
 		}
 	}
 
@@ -47,13 +94,31 @@
 		} catch {
 			/* ignore */
 		}
+		await loadLogList();
+		if (crashParam) {
+			selectedFile = crashParam; // entrada por crash: abrir ese crash-report
+			lastCrash = crashParam;
+		}
 		await loadFile();
 	});
 
-	// Al dejar de ejecutarse, recarga el latest.log recién escrito.
+	// Reacciona a un crash que llega estando ya en la consola (cambia ?crash=).
+	let lastCrash = '';
+	$effect(() => {
+		if (crashParam && crashParam !== lastCrash) {
+			lastCrash = crashParam;
+			loadLogList();
+			selectFile(crashParam);
+		}
+	});
+
+	// Al dejar de ejecutarse, refresca la lista y el latest.log recién escrito.
 	let wasRunning = false;
 	$effect(() => {
-		if (wasRunning && !running) loadFile();
+		if (wasRunning && !running) {
+			loadLogList();
+			loadFile();
+		}
 		wasRunning = running;
 	});
 
@@ -76,14 +141,22 @@
 	<div class="title">
 		<h1>Consola · {inst?.name ?? id}</h1>
 		<div class="dim sub">
-			{#if running}
+			{#if isLive}
 				<span class="livedot"></span>En ejecución · registro en vivo
 			{:else}
-				Último registro de la sesión (latest.log)
+				{selectedFile.split('/').pop()}
 			{/if}
 		</div>
 	</div>
 	<div class="spacer"></div>
+	{#if logFiles.length > 0}
+		<select class="logsel" value={selectedFile} onchange={(e) => selectFile(e.currentTarget.value)}>
+			{#each logFiles as f (f.path)}
+				<option value={f.path}>{optLabel(f)}</option>
+			{/each}
+		</select>
+	{/if}
+	<button class="ghost" title="Abrir carpeta de logs" onclick={openLogs}><Icon name="folder" size={15} /></button>
 	<div class="filters">
 		{#each ['all', 'info', 'warn', 'error', 'fatal'] as f}
 			<button class="chip {f}" class:on={filter === f} onclick={() => (filter = f as LogLevel | 'all')}>
@@ -91,9 +164,9 @@
 			</button>
 		{/each}
 	</div>
-	{#if !running}
-		<button class="ghost" title="Recargar" onclick={loadFile}><Icon name="refresh" size={15} /></button>
-	{/if}
+	<button class="ghost" title="Recargar" onclick={() => { loadLogList(); loadFile(); }}>
+		<Icon name="refresh" size={15} />
+	</button>
 </header>
 
 <div class="summary dim">
@@ -102,13 +175,13 @@
 </div>
 
 <div class="console" bind:this={box} onscroll={onScroll}>
-	{#if loadingFile && !running}
+	{#if loadingFile && !isLive}
 		<div class="empty dim">Cargando log…</div>
 	{:else if shown.length === 0}
 		<div class="empty dim">
-			{running
+			{isLive
 				? 'Esperando la salida del juego…'
-				: 'Todavía no hay registros. Lanzá la instancia para generar uno.'}
+				: 'Este registro está vacío o todavía no se generó.'}
 		</div>
 	{:else}
 		{#each shown as l}
@@ -164,6 +237,16 @@
 	.filters {
 		display: flex;
 		gap: 4px;
+	}
+	.logsel {
+		background: var(--bg-card);
+		border: 1px solid var(--border);
+		color: var(--text);
+		border-radius: 8px;
+		padding: 6px 9px;
+		font-family: inherit;
+		font-size: 12px;
+		max-width: 220px;
 	}
 	.chip {
 		background: var(--bg-card);

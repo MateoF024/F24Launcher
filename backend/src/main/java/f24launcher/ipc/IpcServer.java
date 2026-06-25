@@ -42,6 +42,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
+import java.util.stream.Stream;
 
 /**
  * Servidor IPC local del backend (127.0.0.1, puerto efímero, token de sesión).
@@ -188,7 +189,6 @@ public class IpcServer {
                 }
                 if (r.favorite != null) cfg.favorite = r.favorite;
                 if (r.group != null) cfg.group = r.group.trim();
-                if (r.useAikarFlags != null) cfg.useAikarFlags = r.useAikarFlags;
             }
             instanceManager.save(cfg);
             json(ctx, cfg);
@@ -252,11 +252,59 @@ public class IpcServer {
             ctx.status(204);
         });
 
-        // Devuelve las últimas líneas del latest.log de la instancia (para la consola).
+        // Lista los archivos de log/crash de la instancia (para el selector de la consola).
+        app.get("/instances/{id}/logs", ctx -> {
+            String id = ctx.pathParam("id");
+            if (instanceManager.get(id) == null) { ctx.status(404).result("no existe"); return; }
+            Path base = LauncherPaths.instanceGameDir(id);
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (String sub : new String[]{"logs", "crash-reports"}) {
+                Path dir = base.resolve(sub);
+                if (!Files.isDirectory(dir)) continue;
+                try (Stream<Path> files = Files.list(dir)) {
+                    files.filter(Files::isRegularFile)
+                         .filter(p -> { String n = p.getFileName().toString().toLowerCase();
+                                        return n.endsWith(".log") || n.endsWith(".txt"); })
+                         .forEach(p -> {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("name", p.getFileName().toString());
+                            m.put("path", base.relativize(p).toString().replace('\\', '/'));
+                            m.put("crash", "crash-reports".equals(sub));
+                            m.put("mtime", mtime(p));
+                            out.add(m);
+                         });
+                } catch (Exception ignored) {}
+            }
+            out.sort(Comparator.comparingLong((Map<String, Object> m) -> (Long) m.get("mtime")).reversed());
+            json(ctx, out);
+        });
+
+        // Abre la carpeta de logs de la instancia en el explorador de Windows.
+        app.post("/instances/{id}/logs/open", ctx -> {
+            String id = ctx.pathParam("id");
+            if (instanceManager.get(id) == null) { ctx.status(404).result("no existe"); return; }
+            Path dir = LauncherPaths.instanceGameDir(id).resolve("logs");
+            try {
+                Files.createDirectories(dir);
+                new ProcessBuilder("explorer.exe", dir.toString()).start();
+                ctx.status(204);
+            } catch (Exception e) {
+                log.warn("No se pudo abrir los logs de {}: {}", id, e.getMessage());
+                ctx.status(500).result("No se pudo abrir la carpeta de logs");
+            }
+        });
+
+        // Devuelve las últimas líneas de un log de la instancia (para la consola).
+        // ?file=<relativo> (por defecto logs/latest.log); validado dentro de la instancia.
         app.get("/instances/{id}/log", ctx -> {
             String id = ctx.pathParam("id");
             if (instanceManager.get(id) == null) { ctx.status(404).result("no existe"); return; }
-            Path logFile = LauncherPaths.instanceGameDir(id).resolve("logs").resolve("latest.log");
+            Path base = LauncherPaths.instanceGameDir(id);
+            String rel = ctx.queryParam("file");
+            Path logFile = (rel == null || rel.isBlank())
+                    ? base.resolve("logs").resolve("latest.log")
+                    : base.resolve(rel).normalize();
+            if (!logFile.startsWith(base)) { ctx.status(400).result("ruta inválida"); return; }
             List<String> lines = new ArrayList<>();
             if (Files.exists(logFile)) {
                 try {
@@ -345,6 +393,34 @@ public class IpcServer {
                 instanceManager.migrateInstances(oldInstances, newInstances);
             }
             json(ctx, settingsView());
+        });
+
+        // ── Grupos de instancias (gestionados en la ventana de Instancias) ──
+        // Devuelve la unión de los grupos persistidos (incl. vacíos) y los que ya
+        // usan las instancias, ordenados alfabéticamente.
+        app.get("/groups", ctx -> json(ctx, allGroups()));
+
+        // Crea un grupo vacío.
+        app.post("/groups", ctx -> {
+            GroupReq req = gson.fromJson(ctx.body(), GroupReq.class);
+            if (req == null || req.name == null || req.name.isBlank()) {
+                ctx.status(400).result("name requerido"); return;
+            }
+            AppSettings.getInstance().addGroup(req.name);
+            json(ctx, allGroups());
+        });
+
+        // Elimina un grupo: lo quita de la lista y desasigna las instancias que lo usaban.
+        app.delete("/groups/{name}", ctx -> {
+            String name = ctx.pathParam("name");
+            AppSettings.getInstance().removeGroup(name);
+            for (InstanceConfig cfg : instanceManager.list()) {
+                if (cfg.group != null && cfg.group.equalsIgnoreCase(name)) {
+                    cfg.group = "";
+                    instanceManager.save(cfg);
+                }
+            }
+            ctx.status(204);
         });
 
         // Purga la caché de la app (metadatos/HTTP). No toca datos de juego.
@@ -632,7 +708,8 @@ public class IpcServer {
             InstallReq req = gson.fromJson(ctx.body(), InstallReq.class);
             try {
                 InstalledItem item = contentInstaller.install(cfg, req.source,
-                        ContentType.from(req.type), req.projectId, req.versionId, req.ignore);
+                        ContentType.from(req.type), req.projectId, req.versionId, req.ignore,
+                        (phase, d, t) -> eventBus.publish("contentProgress", progressEvent(cfg.id, phase, d, t)));
                 json(ctx, item);
             } catch (Exception e) {
                 log.error("Error instalando contenido en {}: {}", cfg.id, e.getMessage());
@@ -891,11 +968,25 @@ public class IpcServer {
     private void runLaunch(InstanceConfig cfg, Account account) {
         try {
             eventBus.publish("state", stateEvent(cfg.id, "launching", null));
+            long startMs = System.currentTimeMillis();
             gameLauncher.launch(cfg, account, new GameLauncher.LogSink() {
                 @Override public void onLine(String line) {
                     eventBus.publish("log", logEvent(cfg.id, line));
                 }
                 @Override public void onExit(int code) {
+                    long elapsed = Math.max(0, System.currentTimeMillis() - startMs);
+                    // Recarga la config (pudo editarse durante la sesión) y acumula el
+                    // tiempo de juego total + la fecha de la última sesión (P5).
+                    InstanceConfig fresh = instanceManager.get(cfg.id);
+                    if (fresh != null) {
+                        fresh.totalPlayMs += elapsed;
+                        fresh.lastPlayed = System.currentTimeMillis();
+                        instanceManager.save(fresh);
+                    }
+                    // Detección de crash (P8): salida no nula o crash-report nuevo.
+                    String crash = recentCrashReport(cfg.id, startMs);
+                    if (code != 0 || crash != null)
+                        eventBus.publish("crash", crashEvent(cfg.id, code, crash));
                     eventBus.publish("state", stateEvent(cfg.id, "stopped", "exit " + code));
                 }
             });
@@ -906,6 +997,35 @@ public class IpcServer {
             log.error("Error lanzando {}: {}", cfg.id, msg(e), e);
             eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
         }
+    }
+
+    /** Crash-report más reciente generado desde {@code sinceMs}, como ruta relativa, o null. */
+    private String recentCrashReport(String id, long sinceMs) {
+        Path dir = LauncherPaths.instanceGameDir(id).resolve("crash-reports");
+        if (!Files.isDirectory(dir)) return null;
+        try (Stream<Path> files = Files.list(dir)) {
+            Path newest = files.filter(Files::isRegularFile)
+                    .filter(p -> { String n = p.getFileName().toString().toLowerCase();
+                                   return n.endsWith(".txt") || n.endsWith(".log"); })
+                    .max(Comparator.comparingLong(IpcServer::mtime))
+                    .orElse(null);
+            if (newest == null || mtime(newest) < sinceMs) return null;
+            return "crash-reports/" + newest.getFileName();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static long mtime(Path p) {
+        try { return Files.getLastModifiedTime(p).toMillis(); } catch (Exception e) { return 0; }
+    }
+
+    private Map<String, Object> crashEvent(String id, int code, String file) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("instanceId", id);
+        m.put("code", code);
+        m.put("file", file == null ? "" : file);
+        return m;
     }
 
     private Map<String, Object> logEvent(String id, String line) {
@@ -960,6 +1080,16 @@ public class IpcServer {
         http.evictConnections();
         content.clearCaches();
         return freed;
+    }
+
+    /** Unión ordenada de los grupos persistidos (incl. vacíos) y los usados por las instancias. */
+    private List<String> allGroups() {
+        TreeSet<String> set = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        set.addAll(AppSettings.getInstance().getGroups());
+        for (InstanceConfig cfg : instanceManager.list()) {
+            if (cfg.group != null && !cfg.group.isBlank()) set.add(cfg.group.trim());
+        }
+        return new ArrayList<>(set);
     }
 
     /** Vista serializable de los ajustes globales. */
@@ -1099,7 +1229,8 @@ public class IpcServer {
     private record UpdateReq(String name, Integer minMemoryMb, Integer maxMemoryMb,
                              Integer windowWidth, Integer windowHeight, Boolean fullscreen,
                              String jvmArgs, String javaPathOverride, String iconData,
-                             Boolean favorite, String group, Boolean useAikarFlags) {}
+                             Boolean favorite, String group) {}
+    private record GroupReq(String name) {}
     private record SkinReq(String url, String variant) {}
     private record SkinUploadReq(String data, String fileName, String variant) {}
     private record CapeReq(String capeId) {}

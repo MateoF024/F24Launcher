@@ -122,11 +122,11 @@ export interface Instance {
 	javaPathOverride: string;
 	installed: boolean;
 	lastPlayed: number;
+	totalPlayMs: number;
 	sourceModpackId: string;
 	icon: string;
 	favorite: boolean;
 	group: string;
-	useAikarFlags: boolean;
 }
 
 export interface VanillaVersion {
@@ -203,6 +203,10 @@ export interface InstalledItem {
 	categories: string[];
 	clientSide: string;
 	serverSide: string;
+	/** Epoch ms en que se agregó a la instancia (para ordenar). */
+	addedAt: number;
+	/** Fecha ISO de publicación de la versión instalada (para "actualizados recientemente"). */
+	datePublished: string;
 }
 
 export interface UpdateInfo {
@@ -434,7 +438,6 @@ export interface InstanceSettings {
 	iconData?: string;
 	favorite?: boolean;
 	group?: string;
-	useAikarFlags?: boolean;
 }
 
 export const updateInstance = (id: string, body: InstanceSettings) =>
@@ -467,8 +470,37 @@ export const duplicateInstance = (id: string) =>
 export const openInstanceFolder = (id: string) =>
 	api<void>(`/instances/${id}/open`, { method: 'POST' });
 
-/** Últimas líneas del latest.log de la instancia. */
-export const getInstanceLog = (id: string) => api<string[]>(`/instances/${id}/log`);
+/** Un archivo de log/crash de la instancia (para el selector de la consola). */
+export interface InstanceLogFile {
+	name: string;
+	path: string;
+	crash: boolean;
+	mtime: number;
+}
+
+/** Lista los archivos de log y crash-reports de la instancia (más recientes primero). */
+export const listInstanceLogs = (id: string) =>
+	api<InstanceLogFile[]>(`/instances/${id}/logs`);
+
+/** Últimas líneas de un log de la instancia (por defecto logs/latest.log). */
+export const getInstanceLog = (id: string, file?: string) =>
+	api<string[]>(`/instances/${id}/log${file ? `?file=${encodeURIComponent(file)}` : ''}`);
+
+/** Abre la carpeta de logs de la instancia en el explorador. */
+export const openInstanceLogs = (id: string) =>
+	api<void>(`/instances/${id}/logs/open`, { method: 'POST' });
+
+// ── Grupos de instancias ──
+/** Lista los grupos (persistidos + los usados por instancias), ordenados. */
+export const listGroups = () => api<string[]>('/groups');
+
+/** Crea un grupo vacío; devuelve la lista resultante. */
+export const createGroup = (name: string) =>
+	api<string[]>('/groups', { method: 'POST', body: JSON.stringify({ name }) });
+
+/** Elimina un grupo y desasigna las instancias que lo usaban. */
+export const deleteGroup = (name: string) =>
+	api<void>(`/groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
 
 // ── Ajustes globales ──
 export interface AppSettingsDto {

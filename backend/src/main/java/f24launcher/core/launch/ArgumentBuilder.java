@@ -29,11 +29,10 @@ public class ArgumentBuilder {
 
         List<String> cmd = new ArrayList<>();
         cmd.add(javaExe);
-        cmd.add("-Xms" + Math.max(256, cfg.minMemoryMb) + "m");
-        cmd.add("-Xmx" + Math.max(cfg.minMemoryMb, cfg.maxMemoryMb) + "m");
-        // Aikar flags por defecto (desactivables). Van antes de los args del usuario
-        // para que estos puedan sobrescribir cualquiera (en la JVM gana el último).
-        if (cfg.useAikarFlags) cmd.addAll(aikarFlags(Math.max(cfg.minMemoryMb, cfg.maxMemoryMb)));
+        // Solo se preconfigura la memoria máxima (-Xmx). La mínima (-Xms) ya no se
+        // inyecta: queda a cargo del usuario vía los argumentos JVM de la instancia
+        // (que por defecto incluyen el preset Aikar, sembrado al crear la instancia).
+        cmd.add("-Xmx" + Math.max(512, cfg.maxMemoryMb) + "m");
         if (cfg.jvmArgs != null && !cfg.jvmArgs.isBlank()) {
             for (String a : cfg.jvmArgs.trim().split("\\s+")) cmd.add(a);
         }
@@ -63,37 +62,6 @@ public class ArgumentBuilder {
             cmd.add(String.valueOf(cfg.windowHeight));
         }
         return cmd;
-    }
-
-    /**
-     * Aikar flags: preset de GC G1 ampliamente probado para Minecraft. Ajusta unos
-     * pocos valores para heaps grandes (≥12 GB), como recomienda Aikar.
-     * Ref.: https://docs.papermc.io/paper/aikars-flags
-     */
-    private List<String> aikarFlags(int maxMemoryMb) {
-        boolean big = maxMemoryMb >= 12288;
-        List<String> f = new ArrayList<>();
-        f.add("-XX:+UseG1GC");
-        f.add("-XX:+ParallelRefProcEnabled");
-        f.add("-XX:MaxGCPauseMillis=200");
-        f.add("-XX:+UnlockExperimentalVMOptions");
-        f.add("-XX:+DisableExplicitGC");
-        f.add("-XX:+AlwaysPreTouch");
-        f.add("-XX:G1NewSizePercent=" + (big ? "40" : "30"));
-        f.add("-XX:G1MaxNewSizePercent=" + (big ? "50" : "40"));
-        f.add("-XX:G1HeapRegionSize=" + (big ? "16M" : "8M"));
-        f.add("-XX:G1ReservePercent=" + (big ? "15" : "20"));
-        f.add("-XX:G1HeapWastePercent=5");
-        f.add("-XX:G1MixedGCCountTarget=4");
-        f.add("-XX:InitiatingHeapOccupancyPercent=" + (big ? "20" : "15"));
-        f.add("-XX:G1MixedGCLiveThresholdPercent=90");
-        f.add("-XX:G1RSetUpdatingPauseTimePercent=5");
-        f.add("-XX:SurvivorRatio=32");
-        f.add("-XX:+PerfDisableSharedMem");
-        f.add("-XX:MaxTenuringThreshold=1");
-        f.add("-Dusing.aikars.flags=https://mcflags.emc.gs");
-        f.add("-Daikars.new.flags=true");
-        return f;
     }
 
     private String buildClasspath(String mcVersion, VersionDetails v) {

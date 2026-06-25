@@ -46,7 +46,8 @@ public final class ContentModels {
             String fileName, String type, boolean enabled,
             String source, String projectId, String slug, String name,
             String iconUrl, String author, String versionId, String versionName,
-            List<String> categories, String clientSide, String serverSide) {}
+            List<String> categories, String clientSide, String serverSide,
+            long addedAt, String datePublished) {}
 
     /** Una actualización disponible para un elemento instalado. */
     public record UpdateInfo(String fileName, String type, String versionId, String versionName) {}

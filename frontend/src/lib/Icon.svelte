@@ -115,6 +115,19 @@
 		<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
 	{:else if name === 'terminal'}
 		<path d="M4 17l6-6-6-6M12 19h8" />
+	{:else if name === 'more'}
+		<circle cx="12" cy="5" r="1.6" fill="currentColor" stroke="none" />
+		<circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
+		<circle cx="12" cy="19" r="1.6" fill="currentColor" stroke="none" />
+	{:else if name === 'export'}
+		<path d="M12 16V4M8 8l4-4 4 4" />
+		<path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+	{:else if name === 'sort'}
+		<path d="M3 6h11M3 12h7M3 18h3" />
+		<path d="M18 4v16M14 16l4 4 4-4" />
+	{:else if name === 'updown'}
+		<path d="M7 4v16M4 7l3-3 3 3" />
+		<path d="M17 20V4M14 17l3 3 3-3" />
 	{:else}
 		<circle cx="12" cy="12" r="9" />
 	{/if}

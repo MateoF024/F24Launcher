@@ -35,6 +35,11 @@ public class ContentManifest {
         public List<String> categories;
         public String clientSide;
         public String serverSide;
+        // Para ordenar la lista de contenido (0.0.4): cuándo se agregó a la instancia
+        // (epoch ms; se fija al instalar y se conserva al actualizar) y la fecha de
+        // publicación de la versión instalada (ISO; para "actualizados recientemente").
+        public long addedAt;
+        public String datePublished;
         // Datos para exportar (mrpack/.f24pack) y verificar integridad. Se rellenan
         // al instalar desde el launcher; pueden faltar en mods añadidos a mano.
         public String downloadUrl;

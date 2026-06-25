@@ -13,13 +13,16 @@
 		instanceIconUrl,
 		importModpack,
 		updateInstance,
+		listGroups,
+		createGroup,
+		deleteGroup,
 		type VanillaVersion,
 		type Instance
 	} from '$lib/ipc';
 	import { goto } from '$app/navigation';
 	import { ui, refreshInstances, setProgress, setStatus, clearError, bumpIconBust } from '$lib/store.svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { fade, fly, scale } from 'svelte/transition';
+	import { fade, fly, scale, slide } from 'svelte/transition';
 
 	let allVersions = $state<VanillaVersion[]>([]);
 	let showBeta = $state(false);
@@ -82,6 +85,7 @@
 	onMount(() => {
 		loadVersions();
 		loadDefaults();
+		loadGroups();
 	});
 
 	$effect(() => {
@@ -203,6 +207,7 @@
 	}
 
 	function openInstance(e: Event, id: string) {
+		if (suppressClick) return; // veníamos de arrastrar, no abrir
 		if ((e.target as HTMLElement).closest('button')) return;
 		goto(`/instance/${id}`);
 	}
@@ -213,20 +218,107 @@
 		await refreshInstances();
 	}
 
-	// Agrupa las instancias por su campo `group`. Las sin grupo van primero (sin
-	// cabecera); los grupos con nombre, después, ordenados alfabéticamente.
-	const grouped = $derived.by(() => {
-		const map = new Map<string, Instance[]>();
-		for (const inst of ui.instances) {
-			const g = inst.group || '';
-			(map.get(g) ?? map.set(g, []).get(g)!).push(inst);
+	// ── Grupos (P14): se gestionan en esta ventana, no por instancia ──
+	let groups = $state<string[]>([]);
+	let addingGroup = $state(false);
+	let newGroupName = $state('');
+
+	const ungrouped = $derived(ui.instances.filter((i) => !i.group));
+	const instancesIn = (g: string) => ui.instances.filter((i) => (i.group || '') === g);
+
+	async function loadGroups() {
+		try {
+			groups = await listGroups();
+		} catch {
+			/* el backend puede no estar listo aún */
 		}
-		const named = [...map.keys()].filter((g) => g).sort((a, b) => a.localeCompare(b));
-		const out: { name: string; items: Instance[] }[] = [];
-		if (map.has('')) out.push({ name: '', items: map.get('')! });
-		for (const n of named) out.push({ name: n, items: map.get(n)! });
-		return out;
-	});
+	}
+
+	function startAddGroup() {
+		addingGroup = true;
+		newGroupName = '';
+	}
+
+	async function confirmAddGroup() {
+		const n = newGroupName.trim();
+		if (!n) {
+			addingGroup = false;
+			return;
+		}
+		try {
+			groups = await createGroup(n);
+		} finally {
+			addingGroup = false;
+			newGroupName = '';
+		}
+	}
+
+	async function removeGroup(g: string) {
+		await deleteGroup(g);
+		await loadGroups();
+		await refreshInstances(); // el backend desasigna las instancias que lo usaban
+	}
+
+	// Arrastrar y soltar tarjetas entre "Instancias" (grupo '') y los grupos.
+	// Se usa con eventos de puntero, NO con HTML5 draggable: el webview de Tauri
+	// intercepta el drag-drop nativo (para importar modpacks soltándolos) y eso
+	// rompe el HTML5 drag dentro de la página (cursor de "bloqueado").
+	let draggedId = $state<string | null>(null);
+	let dropTarget = $state<string | null>(null);
+	let dragGhost = $state<{ id: string; name: string; icon: string; x: number; y: number } | null>(null);
+	let dragPending: { id: string; name: string; icon: string; x: number; y: number } | null = null;
+	let suppressClick = false;
+
+	function onCardPointerDown(e: PointerEvent, inst: Instance) {
+		if (e.button !== 0) return; // solo botón principal
+		if ((e.target as HTMLElement).closest('button')) return; // no arrancar sobre botones internos
+		dragPending = { id: inst.id, name: inst.name, icon: inst.icon, x: e.clientX, y: e.clientY };
+		window.addEventListener('pointermove', onPointerMove);
+		window.addEventListener('pointerup', onPointerUp);
+		window.addEventListener('pointercancel', onPointerUp);
+	}
+
+	function onPointerMove(e: PointerEvent) {
+		if (dragPending && !draggedId) {
+			if (Math.hypot(e.clientX - dragPending.x, e.clientY - dragPending.y) < 6) return;
+			draggedId = dragPending.id; // supera el umbral → empieza el arrastre real
+			dragGhost = { ...dragPending };
+		}
+		if (draggedId) {
+			e.preventDefault();
+			if (dragGhost) dragGhost = { ...dragGhost, x: e.clientX, y: e.clientY };
+			dropTarget = zoneAt(e.clientX, e.clientY);
+		}
+	}
+
+	function zoneAt(x: number, y: number): string | null {
+		const el = document.elementFromPoint(x, y) as HTMLElement | null;
+		const zone = el?.closest('[data-drop]') as HTMLElement | null;
+		return zone ? (zone.getAttribute('data-drop') ?? '') : null;
+	}
+
+	async function onPointerUp() {
+		window.removeEventListener('pointermove', onPointerMove);
+		window.removeEventListener('pointerup', onPointerUp);
+		window.removeEventListener('pointercancel', onPointerUp);
+		const id = draggedId;
+		const target = dropTarget;
+		const wasDragging = !!draggedId;
+		dragPending = null;
+		draggedId = null;
+		dragGhost = null;
+		dropTarget = null;
+		if (!wasDragging) return; // fue un clic: openInstance se encarga
+		suppressClick = true; // evita que el clic posterior abra la instancia
+		setTimeout(() => (suppressClick = false), 0);
+		if (id && target !== null) {
+			const inst = ui.instances.find((i) => i.id === id);
+			if (inst && (inst.group || '') !== target) {
+				await updateInstance(id, { group: target });
+				await refreshInstances();
+			}
+		}
+	}
 </script>
 
 <header>
@@ -248,21 +340,99 @@
 		<p class="dim">Creá una nueva y se descargará e instalará automáticamente.</p>
 	</div>
 {:else}
-	{#each grouped as section (section.name)}
-		{#if section.name}<h2 class="grouphdr">{section.name}</h2>{/if}
-		<div class="grid">
-			{#each section.items as inst, i (inst.id)}
-			{@const prog = ui.progress[inst.id]}
-			{@const state = ui.status[inst.id]}
-			<div
-				class="card"
-				in:fly={{ y: 12, duration: 260, delay: Math.min(i * 35, 280) }}
-				role="button"
-				tabindex="0"
-				title="Gestionar contenido"
-				onclick={(e) => openInstance(e, inst.id)}
-				onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), goto(`/instance/${inst.id}`))}
-			>
+	<!-- P14: secciones fijas "Instancias" (sin grupo) y "Grupos", con arrastrar y soltar -->
+	<section
+		class="zone"
+		class:over={dropTarget === ''}
+		role="group"
+		aria-label="Instancias sin grupo"
+		data-drop=""
+	>
+		<h2 class="secthdr">Instancias</h2>
+		{#if ungrouped.length}
+			<div class="grid">
+				{#each ungrouped as inst, i (inst.id)}
+					{@render card(inst, i)}
+				{/each}
+			</div>
+		{:else}
+			<p class="dim hint">Arrastra instancias aquí para quitarlas de su grupo.</p>
+		{/if}
+	</section>
+
+	<section class="groupssec">
+		<div class="secthead">
+			<h2 class="secthdr">Grupos</h2>
+			{#if addingGroup}
+				<span class="addform">
+					<input
+						class="ginput"
+						placeholder="Nombre del grupo"
+						bind:value={newGroupName}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') confirmAddGroup();
+							else if (e.key === 'Escape') addingGroup = false;
+						}}
+					/>
+					<button class="xs" onclick={confirmAddGroup}>Crear</button>
+					<button class="ghost xs" onclick={() => (addingGroup = false)}>Cancelar</button>
+				</span>
+			{:else}
+				<button class="ghost addgroup" onclick={startAddGroup}>
+					<Icon name="plus" size={14} />Agregar grupo
+				</button>
+			{/if}
+		</div>
+
+		{#if groups.length === 0}
+			<p class="dim hint">No hay grupos todavía. Crea uno y arrastra instancias dentro.</p>
+		{:else}
+			{#each groups as g (g)}
+				<div
+					class="groupbox"
+					class:over={dropTarget === g}
+					role="group"
+					aria-label={g}
+					data-drop={g}
+					transition:slide={{ duration: 160 }}
+				>
+					<div class="grouphead">
+						<span class="gname">{g}</span>
+						<span class="gcount dim">{instancesIn(g).length}</span>
+						<div class="gspacer"></div>
+						<button class="ghost xs danger" title="Eliminar grupo" onclick={() => removeGroup(g)}>
+							<Icon name="trash" size={14} />
+						</button>
+					</div>
+					{#if instancesIn(g).length}
+						<div class="grid">
+							{#each instancesIn(g) as inst, i (inst.id)}
+								{@render card(inst, i)}
+							{/each}
+						</div>
+					{:else}
+						<p class="dim hint">Vacío · arrastra instancias aquí.</p>
+					{/if}
+				</div>
+			{/each}
+		{/if}
+	</section>
+{/if}
+
+{#snippet card(inst: Instance, i: number)}
+	{@const prog = ui.progress[inst.id]}
+	{@const state = ui.status[inst.id]}
+	<div
+		class="card"
+		class:dragging={draggedId === inst.id}
+		in:fly={{ y: 12, duration: 260, delay: Math.min(i * 35, 280) }}
+		role="button"
+		tabindex="0"
+		title="Gestionar contenido"
+		onpointerdown={(e) => onCardPointerDown(e, inst)}
+		onclick={(e) => openInstance(e, inst.id)}
+		onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), goto(`/instance/${inst.id}`))}
+	>
 				<div class="head">
 					{#if inst.icon}
 						<img class="thumb" src={instanceIconUrl(inst.id, ui.iconBust)} alt="" />
@@ -330,9 +500,17 @@
 					</div>
 				{/if}
 			</div>
-			{/each}
-		</div>
-	{/each}
+{/snippet}
+
+{#if dragGhost}
+	<div class="dragghost" style="left:{dragGhost.x}px; top:{dragGhost.y}px">
+		{#if dragGhost.icon}
+			<img src={instanceIconUrl(dragGhost.id, ui.iconBust)} alt="" />
+		{:else}
+			<span class="gph"><Icon name="package" size={15} /></span>
+		{/if}
+		<span class="gname">{dragGhost.name}</span>
+	</div>
 {/if}
 
 <!-- Modal crear -->
@@ -399,7 +577,7 @@
 				<Icon name={advOpen ? 'chevron-down' : 'chevron-right'} size={14} />
 			</button>
 			{#if advOpen}
-				<div class="adv" transition:fade={{ duration: 120 }}>
+				<div class="adv" transition:slide={{ duration: 160 }}>
 					<label class="full">
 						Memoria máxima · <strong>{adv.maxMemoryMb} MB</strong>
 						<input type="range" min="1024" max="16384" step="512" bind:value={adv.maxMemoryMb} />
@@ -497,6 +675,7 @@
 		flex-direction: column;
 		gap: 10px;
 		cursor: pointer;
+		user-select: none;
 		transition:
 			border-color 0.15s ease,
 			transform 0.15s ease;
@@ -549,16 +728,121 @@
 	.starbtn.on {
 		color: var(--accent);
 	}
-	.grouphdr {
+	.secthdr {
 		font-size: 12px;
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.6px;
 		color: var(--text-dim);
-		margin: 20px 0 10px;
+		margin: 0 0 10px;
 	}
-	.grouphdr:first-child {
-		margin-top: 0;
+	/* P14 — zonas de arrastre y secciones de grupos */
+	.zone {
+		border-radius: var(--radius);
+		padding: 8px;
+		margin: 0 -8px 8px;
+		min-height: 56px;
+		transition:
+			box-shadow 0.15s ease,
+			background 0.15s ease;
+	}
+	.zone.over {
+		box-shadow: inset 0 0 0 2px var(--accent);
+		background: rgba(127, 127, 127, 0.05);
+	}
+	.groupssec {
+		margin-top: 22px;
+	}
+	.secthead {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-bottom: 10px;
+	}
+	.secthead .secthdr {
+		margin: 0;
+	}
+	.addgroup {
+		font-size: 12px;
+		padding: 6px 11px;
+	}
+	.addform {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.ginput {
+		min-width: 180px;
+	}
+	.groupbox {
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 12px;
+		margin-bottom: 12px;
+		transition:
+			border-color 0.15s ease,
+			box-shadow 0.15s ease;
+	}
+	.groupbox.over {
+		border-color: var(--accent);
+		box-shadow: inset 0 0 0 1px var(--accent);
+	}
+	.grouphead {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 10px;
+	}
+	.gname {
+		font-weight: 600;
+	}
+	.gcount {
+		font-size: 12px;
+	}
+	.gspacer {
+		flex: 1;
+	}
+	.hint {
+		font-size: 13px;
+		padding: 10px 4px;
+	}
+	.card.dragging {
+		opacity: 0.5;
+	}
+	.dragghost {
+		position: fixed;
+		z-index: 200;
+		pointer-events: none;
+		transform: translate(10px, 10px);
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: var(--bg-elev);
+		border: 1px solid var(--accent);
+		border-radius: 8px;
+		padding: 6px 10px;
+		box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+		font-size: 13px;
+		font-weight: 600;
+		max-width: 220px;
+	}
+	.dragghost img,
+	.dragghost .gph {
+		width: 20px;
+		height: 20px;
+		border-radius: 5px;
+		object-fit: cover;
+		flex-shrink: 0;
+		display: grid;
+		place-items: center;
+		color: var(--text-dim);
+		background: var(--bg-card);
+	}
+	.dragghost .gname {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.name {
 		font-weight: 600;
@@ -649,7 +933,9 @@
 	}
 	.prog .fill {
 		height: 100%;
-		background: var(--accent);
+		background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--accent-dim));
+		background-size: 200% 100%;
+		animation: f24-bar-shine 1.8s linear infinite;
 		transition: width 0.2s ease;
 	}
 	.prog .small {
