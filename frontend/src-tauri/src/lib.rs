@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -8,6 +9,9 @@ use tauri::{Emitter, Manager};
 
 /// Relación de aspecto fija de la ventana (16:9).
 const ASPECT: f64 = 16.0 / 9.0;
+/// Flag de Windows (CREATE_NO_WINDOW): lanza procesos hijo sin abrir una ventana de
+/// consola CMD/PowerShell que parpadearía en primer plano.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Evita el bucle de realimentación al corregir el tamaño nosotros mismos.
 static ADJUSTING: AtomicBool = AtomicBool::new(false);
 
@@ -229,6 +233,7 @@ fn create_instance_shortcut(id: String, name: String) -> Result<(), String> {
 
     let status = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map_err(|e| e.to_string())?;
     if status.success() {
@@ -356,6 +361,7 @@ fn get_handshake(state: tauri::State<IpcState>) -> Option<Handshake> {
 fn open_external(url: String) -> Result<(), String> {
     Command::new("cmd")
         .args(["/C", "start", "", &url])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -487,6 +493,7 @@ fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<Child> {
     let mut child = cmd
         .arg("-jar")
         .arg(&jar)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;

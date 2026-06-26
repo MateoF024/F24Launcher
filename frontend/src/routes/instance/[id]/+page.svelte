@@ -80,6 +80,16 @@
 	// quitar/actualizar mods ni cambiar versión/loader. Sí se puede habilitar/deshabilitar.
 	const isModpack = $derived(!!inst?.sourceModpackId);
 
+	// Tipos de contenido visibles: en vanilla solo resourcepacks y datapacks (mods/shaders
+	// requieren un loader). Se oculta también el filtro de entorno (mod-céntrico).
+	const isVanilla = $derived(inst?.loader === 'vanilla');
+	const shownTypes = $derived(
+		isVanilla ? TYPES.filter((t) => t.id === 'resourcepacks' || t.id === 'datapacks') : TYPES
+	);
+	$effect(() => {
+		if (filter !== 'all' && !shownTypes.some((t) => t.id === filter)) filter = 'all';
+	});
+
 	// Categorías (unificadas y canónicas) presentes entre los elementos del tipo seleccionado.
 	const typed = $derived(items.filter((i) => filter === 'all' || i.type === filter));
 	const typeCats = $derived(canonicalSet(typed.flatMap((i) => i.categories ?? [])));
@@ -424,10 +434,12 @@
 				verForm.loaderVersion !== (inst.loaderVersion ?? ''))
 	);
 	const verReady = $derived(verForm.loader === 'vanilla' || !!verForm.loaderVersion);
-	// P13: al editar, respetar "Mostrar versiones beta"; pero conservar siempre la
-	// versión actual de la instancia aunque sea snapshot/beta (para no perderla del selector).
+	// Toggle local "ver betas/snapshots" (0.0.6: vive en las avanzadas del modal, no en
+	// Ajustes). Se conserva siempre la versión actual de la instancia aunque sea
+	// snapshot/beta para no perderla del selector.
+	let editShowBeta = $state(false);
 	const mcVersionsShown = $derived(
-		ui.settings?.showBetaVersions
+		editShowBeta
 			? mcVersions
 			: mcVersions.filter((v) => v.type === 'release' || v.id === inst?.mcVersion)
 	);
@@ -468,6 +480,7 @@
 			javaPathOverride: inst.javaPathOverride ?? ''
 		};
 		settingsAdvOpen = false;
+		editShowBeta = false; // por defecto solo releases (toggle local en avanzadas)
 		editIcon = null;
 		verForm = { mcVersion: inst.mcVersion, loader: inst.loader, loaderVersion: inst.loaderVersion ?? '' };
 		compatReport = null;
@@ -657,14 +670,23 @@
 
 	// ── Acceso directo de escritorio ──
 	let shortcutMsg = $state('');
+	let shortcutBusy = $state(false);
 	async function createShortcut() {
-		if (!inst) return;
+		if (!inst || shortcutBusy) return;
+		shortcutBusy = true;
+		shortcutMsg = '';
+		const started = Date.now();
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
 			await invoke('create_instance_shortcut', { id: inst.id, name: inst.name });
+			// La creación es casi instantánea; aseguramos que la tarjeta de progreso se vea.
+			const wait = 600 - (Date.now() - started);
+			if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 			shortcutMsg = 'Acceso directo creado en el escritorio.';
 		} catch (e) {
 			shortcutMsg = 'No se pudo crear el acceso directo: ' + (e as Error).message;
+		} finally {
+			shortcutBusy = false;
 		}
 		setTimeout(() => (shortcutMsg = ''), 4500);
 	}
@@ -853,8 +875,17 @@
 	{/if}
 </header>
 
-{#if shortcutMsg}
-	<div class="stoast" transition:fade={{ duration: 120 }}>{shortcutMsg}</div>
+{#if shortcutBusy || shortcutMsg}
+	<div class="stoast" transition:fade={{ duration: 120 }}>
+		{#if shortcutBusy}
+			<div class="screating">
+				<span>Creando acceso directo…</span>
+				<div class="sbar"><div class="sfill"></div></div>
+			</div>
+		{:else}
+			{shortcutMsg}
+		{/if}
+	</div>
 {/if}
 
 <div class="toolbar">
@@ -875,7 +906,7 @@
 
 <div class="chips">
 	<button class:active={filter === 'all'} onclick={() => (filter = 'all')}>Todos ({items.length})</button>
-	{#each TYPES as t}
+	{#each shownTypes as t}
 		<button class:active={filter === t.id} onclick={() => (filter = t.id)}>
 			{t.label} ({counts[t.id] ?? 0})
 		</button>
@@ -885,15 +916,17 @@
 </div>
 
 <div class="filterbar">
-	<div class="fgroup">
-		<span class="flabel">Entorno</span>
-		<button class="fchip" class:active={envFilter.includes('client')} onclick={() => toggleEnv('client')}>
-			<Icon name="monitor" size={14} />Cliente
-		</button>
-		<button class="fchip" class:active={envFilter.includes('server')} onclick={() => toggleEnv('server')}>
-			<Icon name="server" size={14} />Servidor
-		</button>
-	</div>
+	{#if !isVanilla}
+		<div class="fgroup">
+			<span class="flabel">Entorno</span>
+			<button class="fchip" class:active={envFilter.includes('client')} onclick={() => toggleEnv('client')}>
+				<Icon name="monitor" size={14} />Cliente
+			</button>
+			<button class="fchip" class:active={envFilter.includes('server')} onclick={() => toggleEnv('server')}>
+				<Icon name="server" size={14} />Servidor
+			</button>
+		</div>
+	{/if}
 	{#if typeCats.length}
 		<div class="fgroup">
 			<span class="flabel">Categoría</span>
@@ -1129,7 +1162,7 @@
 					{#if editIcon || (editIcon === null && inst.icon)}
 						<button type="button" class="ghost danger" onclick={() => (editIcon = '')}>Quitar</button>
 					{/if}
-					<span class="dim small">PNG · se recorta a cuadrado</span>
+					<span class="dim small">.PNG o .GIF</span>
 				</div>
 			</div>
 			<div class="sgrid">
@@ -1254,6 +1287,12 @@
 						<input type="checkbox" bind:checked={form.fullscreen} />
 						Pantalla completa
 					</label>
+					{#if !isModpack}
+						<label class="full chk">
+							<input type="checkbox" bind:checked={editShowBeta} />
+							Mostrar versiones beta y snapshots
+						</label>
+					{/if}
 					<label class="full">
 						JVM
 						<input placeholder="-XX:+UseG1GC …" bind:value={form.jvmArgs} />
@@ -1401,12 +1440,12 @@
 		width: 52px;
 		height: 52px;
 		border-radius: 12px;
-		background: var(--bg-card);
-		border: 1px solid var(--border);
 		flex-shrink: 0;
-		object-fit: cover;
+		object-fit: contain;
 	}
 	.thumb.ph {
+		background: var(--bg-card);
+		border: 1px solid var(--border);
 		display: grid;
 		place-items: center;
 		font-size: 24px;
@@ -1848,12 +1887,12 @@
 		width: 56px;
 		height: 56px;
 		border-radius: 12px;
-		object-fit: cover;
-		background: var(--bg-card);
-		border: 1px solid var(--border);
+		object-fit: contain;
 		flex-shrink: 0;
 	}
 	.prev.ph {
+		background: var(--bg-card);
+		border: 1px solid var(--border);
 		display: grid;
 		place-items: center;
 		color: var(--text-dim);
@@ -2025,11 +2064,6 @@
 		font-size: 13px;
 		color: var(--text);
 	}
-	.exchk input[type='checkbox'] {
-		accent-color: var(--accent);
-		width: 16px;
-		height: 16px;
-	}
 	.experr {
 		background: rgba(255, 107, 107, 0.12);
 		border: 1px solid rgba(255, 107, 107, 0.4);
@@ -2079,12 +2113,6 @@
 		cursor: pointer;
 		padding: 2px 0;
 	}
-	.tlabel input[type='checkbox'] {
-		accent-color: var(--accent);
-		width: 15px;
-		height: 15px;
-		flex-shrink: 0;
-	}
 	.tname {
 		white-space: nowrap;
 		overflow: hidden;
@@ -2103,6 +2131,33 @@
 		font-size: 13px;
 		color: var(--text);
 		box-shadow: 0 10px 26px rgba(0, 0, 0, 0.4);
+	}
+	.screating {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-width: 220px;
+	}
+	.sbar {
+		height: 6px;
+		background: var(--bg-card);
+		border-radius: 4px;
+		overflow: hidden;
+	}
+	.sfill {
+		height: 100%;
+		width: 40%;
+		border-radius: 4px;
+		background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--accent-dim));
+		animation: shortcut-slide 1s ease-in-out infinite;
+	}
+	@keyframes shortcut-slide {
+		0% {
+			transform: translateX(-120%);
+		}
+		100% {
+			transform: translateX(320%);
+		}
 	}
 	.sgrid {
 		display: grid;
@@ -2202,12 +2257,6 @@
 	}
 	.updrow:hover {
 		border-color: var(--accent-dim);
-	}
-	.updrow input[type='checkbox'] {
-		accent-color: var(--accent);
-		width: 16px;
-		height: 16px;
-		flex-shrink: 0;
 	}
 	.updinfo {
 		display: flex;

@@ -113,7 +113,7 @@
 	<section class="card">
 		<div class="logo offline"><Icon name="user" size={26} /></div>
 		<h2>Jugar sin cuenta</h2>
-		<p class="dim">Modo sin conexión: elegí un nombre de jugador. Necesitás tener el juego para usarlo.</p>
+		<p class="dim">Modo sin conexión: elegí un nombre de jugador.</p>
 		<div class="row">
 			<input
 				bind:value={offlineName}
@@ -178,10 +178,11 @@
 		color: var(--text-dim);
 	}
 	.cards {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+		display: flex;
+		flex-direction: column;
 		gap: 16px;
-		margin-bottom: 28px;
+		max-width: 420px;
+		margin: 0 auto 28px;
 	}
 	.card {
 		background: var(--bg-card);

@@ -16,6 +16,7 @@
 	import { refreshAccounts } from '$lib/store.svelte';
 	import Icon from '$lib/Icon.svelte';
 	import SkinView from '$lib/SkinView.svelte';
+	import Skin3D from '$lib/Skin3D.svelte';
 	import { fade, fly } from 'svelte/transition';
 
 	// Skins por defecto del juego, empaquetadas en static/skins.
@@ -145,10 +146,9 @@
 		<!-- Vista previa -->
 		<section class="card preview">
 			<div class="render" class:busy>
-				{#key skinTex}
-					<SkinView url={skinTex} slim={variant === 'slim'} height={260} />
-				{/key}
+				<Skin3D skin={skinTex} cape={activeCape?.url ?? ''} slim={variant === 'slim'} width={210} height={300} />
 			</div>
+			<div class="hint dim small">Arrastra para rotar</div>
 			<div class="badge-variant">{variant === 'slim' ? 'Slim' : 'Clásico'}</div>
 		</section>
 
@@ -319,6 +319,10 @@
 	}
 	.render.busy {
 		opacity: 0.45;
+	}
+	.hint {
+		margin-top: 2px;
+		user-select: none;
 	}
 	.badge-variant {
 		font-size: 12px;

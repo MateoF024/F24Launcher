@@ -29,6 +29,10 @@
 
 	onMount(() => {
 		initClientLog(); // captura consola/errores del webview → logs/frontend-latest.log
+		// Desactiva el menú contextual del clic derecho en toda la app (no queremos
+		// Atrás/Actualizar… del WebView). Se quita al desmontar el layout.
+		const onContextMenu = (e: MouseEvent) => e.preventDefault();
+		document.addEventListener('contextmenu', onContextMenu);
 		let unlistenDrop: (() => void) | undefined;
 		let unlistenOpen: (() => void) | undefined;
 		let unlistenLaunch: (() => void) | undefined;
@@ -85,6 +89,7 @@
 			}
 		})();
 		return () => {
+			document.removeEventListener('contextmenu', onContextMenu);
 			unlistenDrop?.();
 			unlistenOpen?.();
 			unlistenLaunch?.();

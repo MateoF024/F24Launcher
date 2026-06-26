@@ -93,7 +93,6 @@
 		<Icon name="refresh" size={15} />
 	</button>
 </header>
-<p class="dim sub">Catálogo privado de modpacks. Se actualiza en línea.</p>
 
 {#if loading}
 	<p class="dim pad">Cargando catálogo…</p>
@@ -188,10 +187,6 @@
 	}
 	header h1 {
 		font-size: 22px;
-	}
-	.sub {
-		font-size: 13px;
-		margin: 2px 0 20px;
 	}
 	.dim {
 		color: var(--text-dim);

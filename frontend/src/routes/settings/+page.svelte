@@ -16,7 +16,7 @@
 
 	let s = $state<AppSettingsDto | null>(null);
 	let saving = $state(false);
-	let version = $state('0.0.5');
+	let version = $state('0.0.6');
 	let needsRestart = $state(false);
 	let purging = $state(false);
 	let purgeMsg = $state('');
@@ -165,7 +165,7 @@
 
 	<section class="card">
 		<h2>Carpeta de instancias</h2>
-		<p class="dim small">Dónde se guardan las carpetas de juego de las instancias (global, no por instancia).</p>
+		<p class="dim small">Dónde se guardan las instancias de juego.</p>
 		<div class="pathrow">
 			<input class="path" readonly value={effectiveInstancesPath} title={effectiveInstancesPath} />
 			<button class="ghost" onclick={pickInstancesFolder}><Icon name="folder" size={15} />Cambiar</button>
@@ -178,8 +178,8 @@
 
 	<section class="card">
 		<h2>Ventana del launcher</h2>
-		<label class="row">
-			<span>Tamaño por defecto (16:9)</span>
+		<label>
+			<span>Tamaño por defecto</span>
 			<select value={launcherSize} onchange={(e) => setLauncherSize(e.currentTarget.value)}>
 				{#each SIZES as sz}
 					<option value={`${sz.w}x${sz.h}`}>{sz.label}</option>
@@ -193,7 +193,7 @@
 				checked={s.closeToBackground}
 				onchange={(e) => commit({ closeToBackground: e.currentTarget.checked })}
 			/>
-			Al cerrar (X), minimizar a la bandeja en vez de salir
+			Al cerrar, minimizar a la bandeja en vez de salir
 		</label>
 		<label class="chk">
 			<input
@@ -201,13 +201,13 @@
 				checked={s.minimizeOnLaunch}
 				onchange={(e) => commit({ minimizeOnLaunch: e.currentTarget.checked })}
 			/>
-			Al lanzar una instancia, pasar a segundo plano y volver al cerrarla
+			Al iniciar una instancia, pasar el launcher a segundo plano y restaurarlo al cerrarla
 		</label>
 	</section>
 
 	<section class="card">
 		<h2>Nuevas instancias</h2>
-		<p class="dim small">Valores por defecto al crear una instancia (cada una puede ajustarse aparte).</p>
+		<p class="dim small">Valores por defecto al crear una nueva instancia.</p>
 
 		<label class="full">
 			<span>Memoria máxima · <strong>{s.defaultMaxMemoryMb} MB</strong></span>
@@ -222,17 +222,6 @@
 		</label>
 
 		<div class="grid">
-			<label>
-				<span>Memoria mínima (MB)</span>
-				<input
-					type="number"
-					min="256"
-					max="16384"
-					step="256"
-					value={s.defaultMinMemoryMb}
-					onchange={(e) => commit({ defaultMinMemoryMb: Number(e.currentTarget.value) })}
-				/>
-			</label>
 			<label>
 				<span>Ancho ventana juego</span>
 				<input
@@ -266,18 +255,6 @@
 	</section>
 
 	<section class="card">
-		<h2>Versiones</h2>
-		<label class="chk">
-			<input
-				type="checkbox"
-				checked={s.showBetaVersions}
-				onchange={(e) => commit({ showBetaVersions: e.currentTarget.checked })}
-			/>
-			Mostrar versiones beta y snapshots
-		</label>
-	</section>
-
-	<section class="card">
 		<h2>Descargas</h2>
 		<p class="dim small">
 			Cuántos archivos descarga y escribe el launcher a la vez. Baja estos valores si tu conexión o
@@ -305,16 +282,13 @@
 				onchange={(e) => commitConcurrency({ maxConcurrentWrites: Number(e.currentTarget.value) })}
 			/>
 		</label>
-		<p class="dim small">
-			El valor por defecto de escrituras se ajusta a los núcleos de tu procesador.
-		</p>
 	</section>
 
 	<section class="card">
 		<h2>Caché de la app</h2>
 		<p class="dim small">
-			El launcher guarda una caché de datos para acelerar la carga. Purgarla la fuerza a recargar
-			(puede ir más lento un momento). No afecta a tus instancias ni a los archivos del juego.
+			El launcher guarda una caché de datos para acelerar la carga. Puedes limpiarla si deseas. No
+			afecta a tus instancias ni a los archivos del juego.
 		</p>
 		<div class="cacherow">
 			<button class="ghost" onclick={doPurge} disabled={purging}>
@@ -327,9 +301,8 @@
 	<section class="card">
 		<h2>Diagnóstico</h2>
 		<p class="dim small">
-			El launcher guarda registros de cada sesión (los anteriores se comprimen en .zip). Si algo
-			falla, exporta un diagnóstico y compártelo: incluye los logs recientes y los ajustes (sin
-			datos de tu cuenta).
+			El launcher guarda registros de cada sesión. Si algo falla, exporta un diagnóstico y
+			compártelo: incluye los logs recientes y los ajustes (sin datos de tu cuenta).
 		</p>
 		<div class="cacherow">
 			<button class="ghost" onclick={doOpenLogs}>
@@ -404,11 +377,6 @@
 		font-size: 13px;
 		color: var(--text-dim);
 	}
-	label.row {
-		flex-direction: row;
-		align-items: center;
-		justify-content: space-between;
-	}
 	label.chk {
 		flex-direction: row;
 		align-items: center;
@@ -417,7 +385,7 @@
 	}
 	.grid {
 		display: grid;
-		grid-template-columns: repeat(3, 1fr);
+		grid-template-columns: repeat(2, 1fr);
 		gap: 12px;
 	}
 	.banner {
@@ -475,11 +443,6 @@
 	input[type='range'] {
 		accent-color: var(--accent);
 		padding: 0;
-	}
-	input[type='checkbox'] {
-		accent-color: var(--accent);
-		width: 16px;
-		height: 16px;
 	}
 	.about {
 		max-width: 620px;

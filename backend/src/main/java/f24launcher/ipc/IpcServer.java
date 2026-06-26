@@ -87,6 +87,10 @@ public class IpcServer {
             // identify, updates, descarga del modpack…) ya no agota el pool de Jetty,
             // así que una operación lenta no congela el resto de la app.
             cfg.useVirtualThreads = true;
+            // Los iconos de instancia (incl. .gif animados) viajan como base64 en el cuerpo
+            // del POST; el límite por defecto de Javalin (1 MB) se queda corto. 16 MB cubre
+            // un gif de hasta ~8 MB (base64 infla ~33%) más el resto del JSON.
+            cfg.http.maxRequestSize = 16L * 1024 * 1024;
             cfg.bundledPlugins.enableCors(cors -> cors.addRule(rule -> rule.anyHost()));
         });
 
@@ -340,9 +344,10 @@ public class IpcServer {
 
         // Sirve el icono PNG de la instancia (a <img>; token por query-param).
         app.get("/instances/{id}/icon", ctx -> {
-            Path icon = LauncherPaths.instanceIcon(ctx.pathParam("id"));
-            if (!Files.exists(icon)) { ctx.status(404); return; }
-            ctx.contentType("image/png").header("Cache-Control", "no-cache");
+            Path icon = IconStore.iconFile(ctx.pathParam("id")); // prefiere icon.gif (animado) sobre icon.png
+            if (icon == null) { ctx.status(404); return; }
+            String ct = icon.getFileName().toString().endsWith(".gif") ? "image/gif" : "image/png";
+            ctx.contentType(ct).header("Cache-Control", "no-cache");
             ctx.result(Files.readAllBytes(icon));
         });
 

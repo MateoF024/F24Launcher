@@ -42,7 +42,6 @@
 	// Opciones avanzadas (prerellenadas con los valores por defecto de Ajustes).
 	let advOpen = $state(false);
 	let adv = $state({
-		minMemoryMb: 1024,
 		maxMemoryMb: 4096,
 		windowWidth: 1280,
 		windowHeight: 720,
@@ -52,9 +51,7 @@
 	async function loadDefaults() {
 		try {
 			const s = await getSettings();
-			showBeta = s.showBetaVersions;
 			adv = {
-				minMemoryMb: s.defaultMinMemoryMb,
 				maxMemoryMb: s.defaultMaxMemoryMb,
 				windowWidth: s.defaultWindowWidth,
 				windowHeight: s.defaultWindowHeight,
@@ -88,8 +85,10 @@
 		loadGroups();
 	});
 
+	// Selecciona la primera versión válida al cargar o si la actual deja de estar en la
+	// lista (p. ej. al desactivar "ver betas" estando elegida una snapshot).
 	$effect(() => {
-		if (versions.length && !newVersion) newVersion = versions[0].id;
+		if (versions.length && !versions.some((v) => v.id === newVersion)) newVersion = versions[0].id;
 	});
 
 	async function loadVersions() {
@@ -105,6 +104,7 @@
 		showCreate = true;
 		advOpen = false;
 		newIcon = '';
+		showBeta = false; // por defecto solo releases (el toggle vive en avanzadas)
 		loadDefaults();
 		if (versions.length === 0) loadVersions();
 	}
@@ -158,7 +158,6 @@
 				mcVersion: newVersion,
 				loader: newLoader,
 				loaderVersion: newLoader === 'vanilla' ? '' : newLoaderVersion,
-				minMemoryMb: adv.minMemoryMb,
 				maxMemoryMb: adv.maxMemoryMb,
 				windowWidth: adv.windowWidth,
 				windowHeight: adv.windowHeight,
@@ -342,7 +341,10 @@
 {:else if ui.instances.length === 0}
 	<div class="empty">
 		<p>Todavía no creaste ninguna instancia.</p>
-		<p class="dim">Creá una nueva y se descargará e instalará automáticamente.</p>
+		<p class="dim">
+			<button type="button" class="ilink" onclick={openCreate}>Creá</button> una nueva o instala algun
+			<a href="/modpacks">modpack</a>.
+		</p>
 	</div>
 {:else}
 	<!-- P14: secciones fijas "Instancias" (sin grupo) y "Grupos", con arrastrar y soltar -->
@@ -553,26 +555,28 @@
 					{#if newIcon}
 						<button type="button" class="ghost danger" onclick={() => (newIcon = '')}>Quitar</button>
 					{/if}
-					<span class="dim small">PNG · se recorta a cuadrado</span>
+					<span class="dim small">.PNG o .GIF</span>
 				</div>
 			</div>
 			<label>Nombre<input bind:value={newName} placeholder="Mi instancia" /></label>
-			<label>
-				Versión de Minecraft
-				<select bind:value={newVersion} onchange={loadLoaderVersions}>
-					{#each versions as v}<option value={v.id}>{v.id}</option>{/each}
-				</select>
-			</label>
-			<label>
-				Cargador de mods
-				<select bind:value={newLoader} onchange={loadLoaderVersions}>
-					<option value="vanilla">Vanilla (sin mods)</option>
-					<option value="fabric">Fabric</option>
-					<option value="quilt">Quilt</option>
-					<option value="neoforge">NeoForge</option>
-					<option value="forge">Forge</option>
-				</select>
-			</label>
+			<div class="vrow">
+				<label>
+					Versión de Minecraft
+					<select bind:value={newVersion} onchange={loadLoaderVersions}>
+						{#each versions as v}<option value={v.id}>{v.id}</option>{/each}
+					</select>
+				</label>
+				<label>
+					Cargador
+					<select bind:value={newLoader} onchange={loadLoaderVersions}>
+						<option value="vanilla">Vanilla (sin mods)</option>
+						<option value="fabric">Fabric</option>
+						<option value="quilt">Quilt</option>
+						<option value="neoforge">NeoForge</option>
+						<option value="forge">Forge</option>
+					</select>
+				</label>
+			</div>
 			{#if newLoader !== 'vanilla'}
 				<label>
 					Versión de {newLoader}
@@ -600,10 +604,6 @@
 					</label>
 					<div class="advrow">
 						<label>
-							Memoria mínima (MB)
-							<input type="number" min="256" max="16384" step="256" bind:value={adv.minMemoryMb} />
-						</label>
-						<label>
 							Ancho
 							<input type="number" min="640" step="1" bind:value={adv.windowWidth} />
 						</label>
@@ -615,6 +615,10 @@
 					<label class="full">
 						Argumentos JVM
 						<input placeholder="-XX:+UseG1GC …" bind:value={adv.jvmArgs} />
+					</label>
+					<label class="betachk">
+						<input type="checkbox" bind:checked={showBeta} />
+						Mostrar versiones beta y snapshots
 					</label>
 				</div>
 			{/if}
@@ -676,6 +680,19 @@
 		padding: 40px;
 		text-align: center;
 	}
+	.ilink {
+		display: inline;
+		background: none;
+		border: none;
+		padding: 0;
+		margin: 0;
+		color: var(--accent);
+		font: inherit;
+		cursor: pointer;
+	}
+	.ilink:hover {
+		text-decoration: underline;
+	}
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
@@ -710,12 +727,12 @@
 		width: 40px;
 		height: 40px;
 		border-radius: 9px;
-		object-fit: cover;
-		background: var(--bg-elev);
-		border: 1px solid var(--border);
+		object-fit: contain;
 		flex-shrink: 0;
 	}
 	.thumb.ph {
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
 		display: grid;
 		place-items: center;
 		color: var(--text-dim);
@@ -886,12 +903,12 @@
 		width: 56px;
 		height: 56px;
 		border-radius: 12px;
-		object-fit: cover;
-		background: var(--bg-card);
-		border: 1px solid var(--border);
+		object-fit: contain;
 		flex-shrink: 0;
 	}
 	.prev.ph {
+		background: var(--bg-card);
+		border: 1px solid var(--border);
 		display: grid;
 		place-items: center;
 		color: var(--text-dim);
@@ -975,7 +992,8 @@
 		border: 1px solid var(--border);
 		border-radius: 14px;
 		padding: 24px;
-		width: 360px;
+		width: 440px;
+		max-width: calc(100vw - 48px);
 		display: flex;
 		flex-direction: column;
 		gap: 14px;
@@ -986,6 +1004,20 @@
 		gap: 5px;
 		font-size: 13px;
 		color: var(--text-dim);
+	}
+	.vrow {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 10px;
+	}
+	.vrow label {
+		min-width: 0;
+	}
+	.modal label.betachk {
+		flex-direction: row;
+		align-items: center;
+		gap: 9px;
+		color: var(--text);
 	}
 	.advtoggle {
 		background: var(--bg-card);

@@ -60,6 +60,13 @@
 	const loaderEff = $derived(loaderLocked ? (inst?.loader ?? '') : loaderFilter);
 	const filtersOff = $derived(!mcLocked || !loaderLocked);
 
+	// En vanilla solo se pueden instalar resourcepacks y datapacks (mods/shaders necesitan
+	// un loader); el resto de pestañas y filtros (loader/entorno) ya quedan ocultos.
+	const isVanilla = $derived(inst?.loader === 'vanilla');
+	const shownTypes = $derived(
+		isVanilla ? TYPES.filter((t) => t.id === 'resourcepacks' || t.id === 'datapacks') : TYPES
+	);
+
 	let hits = $state<ContentProject[]>([]);
 	let total = $state(0);
 	let loading = $state(false);
@@ -84,6 +91,10 @@
 		if (inst?.sourceModpackId) {
 			goto(`/instance/${id}`);
 			return;
+		}
+		// En vanilla la pestaña por defecto ('mods') no aplica: empezar en resourcepacks.
+		if (inst?.loader === 'vanilla' && type !== 'resourcepacks' && type !== 'datapacks') {
+			type = 'resourcepacks';
 		}
 		await loadInstalled();
 		try {
@@ -373,7 +384,7 @@
 {:else}
 	<!-- Catálogo -->
 	<div class="tabs">
-		{#each TYPES as t}
+		{#each shownTypes as t}
 			<button class:active={type === t.id} onclick={() => pickType(t.id)}>{t.label}</button>
 		{/each}
 		<div class="srcsel">
