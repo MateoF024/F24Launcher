@@ -26,6 +26,9 @@
 		exportInstance,
 		listInstanceFiles,
 		repairInstance,
+		getModpackStatus,
+		updateModpackInstance,
+		type ModpackStatus,
 		type FileEntry,
 		type Instance,
 		type InstalledItem,
@@ -73,6 +76,9 @@
 
 	const activeAccount = $derived(ui.accounts.find((a) => a.active));
 	const runState = $derived(inst ? ui.status[inst.id] : '');
+	// Admin restringida (0.0.5): una instancia gestionada por un modpack no admite añadir/
+	// quitar/actualizar mods ni cambiar versión/loader. Sí se puede habilitar/deshabilitar.
+	const isModpack = $derived(!!inst?.sourceModpackId);
 
 	// Categorías (unificadas y canónicas) presentes entre los elementos del tipo seleccionado.
 	const typed = $derived(items.filter((i) => filter === 'all' || i.type === filter));
@@ -141,6 +147,46 @@
 		envFilter = envFilter.includes(e) ? envFilter.filter((x) => x !== e) : [...envFilter, e];
 	}
 
+	// Estado de actualización del modpack (solo para instancias de modpack).
+	let modpackStatus = $state<ModpackStatus | null>(null);
+	let updatingModpack = $state(false);
+
+	async function loadModpackStatus() {
+		if (!inst?.sourceModpackId) {
+			modpackStatus = null;
+			return;
+		}
+		try {
+			modpackStatus = await getModpackStatus(id);
+		} catch {
+			modpackStatus = null;
+		}
+	}
+
+	async function updateModpack() {
+		if (updatingModpack) return;
+		updatingModpack = true;
+		try {
+			await updateModpackInstance(id);
+			setProgress(id, { phase: 'Actualizando modpack', done: 0, total: 1 });
+		} catch (e) {
+			updatingModpack = false;
+			// el estado de error llega por WS; no hace falta nada más aquí
+		}
+	}
+
+	// Al terminar una instalación/actualización (desaparece la barra), refrescar el estado.
+	let lastProgressActive = false;
+	$effect(() => {
+		const active = !!(inst && ui.progress[inst.id]);
+		if (lastProgressActive && !active) {
+			updatingModpack = false;
+			loadModpackStatus();
+			refresh();
+		}
+		lastProgressActive = active;
+	});
+
 	onMount(async () => {
 		nowTs = Date.now(); // recalcula "desde la última sesión" al entrar
 		await ipcReady;
@@ -150,11 +196,16 @@
 			/* no existe */
 		}
 		await refresh();
+		loadModpackStatus();
 		maybeIdentify();
 	});
 
 	// Drag&drop de archivos sueltos sobre la ventana → contenido de esta instancia (E4).
-	onMount(() => setContentDrop({ id, getType: () => (filter === 'all' ? '' : filter) }));
+	// En instancias de modpack se desactiva (añadir mods no está permitido).
+	$effect(() => {
+		if (inst && !inst.sourceModpackId) setContentDrop({ id, getType: () => (filter === 'all' ? '' : filter) });
+		else clearContentDrop();
+	});
 	onDestroy(() => clearContentDrop());
 
 	// Refresca el contenido al soltar archivos (el store avisa con un contador).
@@ -788,6 +839,16 @@
 	{:else if runState === 'launching'}
 		<button class="busy" disabled>Iniciando…</button>
 	{:else if inst?.installed}
+		{#if modpackStatus?.updateAvailable}
+			<button
+				class="mpupd"
+				onclick={updateModpack}
+				disabled={updatingModpack}
+				title="Actualizar el modpack a la versión {modpackStatus.latest}"
+			>
+				<Icon name="arrow-up" size={13} />{updatingModpack ? 'Actualizando…' : 'Actualizar modpack'}
+			</button>
+		{/if}
 		<button class="play" onclick={play}><Icon name="play" size={13} />Jugar</button>
 	{/if}
 </header>
@@ -798,12 +859,18 @@
 
 <div class="toolbar">
 	<input class="search" placeholder="Buscar en {items.length} elementos…" bind:value={query} />
+	{#if isModpack}
+		<span class="mpnote" title="Esta instancia está gestionada por un modpack"
+			><Icon name="package" size={14} />Gestionada por modpack</span
+		>
+	{:else}
 	{#if updateCount > 0}
 		<button class="upd" disabled={updatingAll} onclick={openUpdateAll}>
 			{updatingAll ? 'Actualizando…' : `Actualizar todos (${updateCount})`}
 		</button>
 	{/if}
 	<button class="primary" onclick={() => goto(`/instance/${id}/browse`)}><Icon name="plus" size={15} />Instalar contenido</button>
+	{/if}
 </div>
 
 <div class="chips">
@@ -867,7 +934,9 @@
 {:else if visible.length === 0}
 	<div class="empty">
 		<p>No hay contenido {filter !== 'all' ? `de ${TYPE_LABEL[filter]}` : 'instalado'}.</p>
-		<button class="primary" onclick={() => goto(`/instance/${id}/browse`)}><Icon name="plus" size={15} />Instalar contenido</button>
+		{#if !isModpack}
+			<button class="primary" onclick={() => goto(`/instance/${id}/browse`)}><Icon name="plus" size={15} />Instalar contenido</button>
+		{/if}
 	</div>
 {:else}
 	<div class="list">
@@ -903,6 +972,7 @@
 					</div>
 				</div>
 				<div class="actions">
+					{#if !isModpack}
 					{#if updates[keyOf(it)]}
 						<button
 							class="updbtn xs"
@@ -918,6 +988,7 @@
 							<Icon name="swap" size={14} />
 						</button>
 					{/if}
+					{/if}
 					<button
 						class="switch"
 						class:on={it.enabled}
@@ -928,9 +999,11 @@
 					>
 						<span class="knob"></span>
 					</button>
+					{#if !isModpack}
 					<button class="ghost xs danger" title="Eliminar" onclick={() => remove(it)}>
 						<Icon name="trash" size={15} />
 					</button>
+					{/if}
 				</div>
 			</div>
 		{/each}
@@ -1066,6 +1139,12 @@
 				</label>
 			</div>
 
+			{#if isModpack}
+				<p class="dim small mpversec">
+					<Icon name="package" size={13} />La versión, el loader y los mods los gestiona el modpack;
+					no se pueden cambiar aquí.
+				</p>
+			{:else}
 			<div class="versec">
 				<div class="vsgrid">
 					<label>
@@ -1151,6 +1230,7 @@
 					</div>
 				{/if}
 			</div>
+			{/if}
 
 			<button type="button" class="advtoggle" onclick={() => (settingsAdvOpen = !settingsAdvOpen)}>
 				<Icon name="sliders" size={14} />Opciones avanzadas
@@ -1417,6 +1497,20 @@
 		border: 1px solid var(--border);
 		cursor: progress;
 	}
+	.mpupd {
+		background: #3fa34d;
+		color: #fff;
+		font-weight: 700;
+		padding: 10px 18px;
+		white-space: nowrap;
+	}
+	.mpupd:hover {
+		background: #348540;
+	}
+	.mpupd:disabled {
+		opacity: 0.6;
+		cursor: progress;
+	}
 	.toolbar {
 		display: flex;
 		gap: 12px;
@@ -1479,6 +1573,29 @@
 	.upd:disabled {
 		opacity: 0.6;
 		cursor: progress;
+	}
+	/* Aviso "gestionada por modpack" (admin restringida) */
+	.mpnote {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		white-space: nowrap;
+		font-size: 12px;
+		color: var(--text-dim);
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 7px 11px;
+	}
+	.mpversec {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		padding: 10px 12px;
+		line-height: 1.4;
 	}
 	.filterbar {
 		display: flex;

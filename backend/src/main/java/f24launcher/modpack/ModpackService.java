@@ -45,13 +45,19 @@ public class ModpackService {
         for (Map.Entry<String, JsonElement> e : modpacks.entrySet()) {
             String name = e.getKey();
             JsonElement v = e.getValue();
-            String url = "", mc = "", loader = "", lv = "", icon = "", summary = "", descUrl = "";
+            String urlStandard = "", urlLite = "", version = "";
+            String mc = "", loader = "", lv = "", icon = "", summary = "", descUrl = "";
 
             if (v.isJsonPrimitive() && v.getAsJsonPrimitive().isString()) {
-                url = v.getAsString().trim();
+                // Descriptor legado: solo una URL → se interpreta como variante estándar.
+                urlStandard = v.getAsString().trim();
             } else if (v.isJsonObject()) {
                 JsonObject o = v.getAsJsonObject();
-                url = first(str(o, "url"), str(o, "downloadUrl"));
+                // Esquema 0.0.5: url_standar / url_lite. Retrocompat: url / downloadUrl → estándar.
+                urlStandard = first(str(o, "url_standar"), first(str(o, "urlStandard"),
+                        first(str(o, "url"), str(o, "downloadUrl"))));
+                urlLite = first(str(o, "url_lite"), str(o, "urlLite"));
+                version = str(o, "version");
                 mc = first(str(o, "mcVersion"), str(o, "gameVersion"));
                 loader = str(o, "loader");
                 lv = str(o, "loaderVersion");
@@ -62,11 +68,13 @@ public class ModpackService {
             } else {
                 continue;
             }
-            if (url.isBlank()) {
+            if (urlStandard.isBlank()) {
                 log.warn("Modpack '{}' sin URL válida; se omite.", name);
                 continue;
             }
-            out.add(new Modpack(slug(name), name, url, detectFormat(url), mc, loader, lv, icon, summary, descUrl));
+            // El formato se deduce de la URL estándar (las dos variantes comparten formato).
+            out.add(new Modpack(slug(name), name, version, urlStandard, urlLite,
+                    detectFormat(urlStandard), mc, loader, lv, icon, summary, descUrl));
         }
         return out;
     }

@@ -21,6 +21,8 @@ public class InstanceConfig {
     @Expose public long lastPlayed = 0;
     @Expose public long totalPlayMs = 0;
     @Expose public String sourceModpackId = "";        // id del modpack si vino de uno
+    @Expose public String modpackVersion = "";          // versión del modpack instalada (para detectar updates)
+    @Expose public String modpackVariant = "";          // "standard" | "lite" (vacío = estándar / no aplica)
     @Expose public String icon = "";                     // "icon.png" si hay icono personalizado; vacío = placeholder
     @Expose public boolean favorite = false;             // fijada (se ordena primero)
     @Expose public String group = "";                    // grupo/etiqueta para organizar el grid
@@ -41,6 +43,11 @@ public class InstanceConfig {
      * de MC, y si hay loader, también su tipo y versión. P. ej. {@code 1.20.1} o
      * {@code 1.20.1-fabric-0.15.0}.
      */
+    /** ¿Esta instancia está gestionada por un modpack? (admin restringida en la 0.0.5). */
+    public boolean isModpack() {
+        return sourceModpackId != null && !sourceModpackId.isBlank();
+    }
+
     public String versionKey() {
         if (loader == null || loader.isBlank() || "vanilla".equals(loader)) return mcVersion;
         String lv = (loaderVersion == null || loaderVersion.isBlank()) ? "" : "-" + loaderVersion;

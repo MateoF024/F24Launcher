@@ -20,7 +20,10 @@ import f24launcher.instance.InstanceConfig;
 import f24launcher.instance.InstanceManager;
 import f24launcher.modpack.ModpackExporter;
 import f24launcher.modpack.ModpackInstaller;
+import f24launcher.modpack.ModpackManifest;
+import f24launcher.modpack.ModpackModels.Modpack;
 import f24launcher.modpack.ModpackService;
+import f24launcher.modpack.ModpackUpdater;
 import f24launcher.settings.AppSettings;
 import f24launcher.util.AppExecutors;
 import f24launcher.util.HttpConnectionPool;
@@ -660,6 +663,7 @@ public class IpcServer {
         app.post("/instances/{id}/change-version", ctx -> {
             InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (blockIfModpack(cfg, ctx)) return;
             if (gameLauncher.isRunning(cfg.id)) {
                 ctx.status(409).result("detén la instancia antes de cambiar la versión");
                 return;
@@ -705,6 +709,7 @@ public class IpcServer {
         app.post("/instances/{id}/content/install", ctx -> {
             InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (blockIfModpack(cfg, ctx)) return; // añadir/actualizar mods deshabilitado en modpacks
             InstallReq req = gson.fromJson(ctx.body(), InstallReq.class);
             try {
                 InstalledItem item = contentInstaller.install(cfg, req.source,
@@ -732,6 +737,7 @@ public class IpcServer {
         app.post("/instances/{id}/content/remove", ctx -> {
             InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (blockIfModpack(cfg, ctx)) return; // quitar mods deshabilitado en modpacks
             FileReq req = gson.fromJson(ctx.body(), FileReq.class);
             try {
                 boolean ok = contentInstaller.remove(cfg, req.type, req.fileName);
@@ -745,6 +751,7 @@ public class IpcServer {
         app.post("/instances/{id}/content/import-file", ctx -> {
             InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
             if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (blockIfModpack(cfg, ctx)) return; // añadir mods (arrastrar archivos) deshabilitado en modpacks
             ImportFilesReq req = gson.fromJson(ctx.body(), ImportFilesReq.class);
             if (req == null || req.filePaths == null || req.filePaths.isEmpty()) {
                 ctx.status(400).result("filePaths requerido");
@@ -780,36 +787,31 @@ public class IpcServer {
         });
 
         // Crea una instancia nueva a partir de un modpack y la instala (async, progreso por WS).
+        // Responde de inmediato: la descarga del pack, el parse y la instalación corren en
+        // segundo plano emitiendo progreso por WS desde el primer instante (la barra ya no
+        // se congela en "Preparando…" mientras se descarga/parsea un modpack pesado).
         app.post("/modpacks/install", ctx -> {
             ModpackInstallReq req = gson.fromJson(ctx.body(), ModpackInstallReq.class);
             if (req == null || req.downloadUrl == null || req.downloadUrl.isBlank()) {
                 ctx.status(400).result("downloadUrl requerido");
                 return;
             }
-            Path packFile = null;
             try {
-                packFile = modpackInstaller.download(req.downloadUrl, (p, d, t) -> {});
-                ModpackInstaller.Parsed parsed = modpackInstaller.parse(packFile);
-                String mc = !parsed.mcVersion().isBlank() ? parsed.mcVersion() : nz(req.mcVersion);
-                if (mc.isBlank()) {
-                    Files.deleteIfExists(packFile);
-                    ctx.status(400).result("No se pudo determinar la versión de Minecraft del modpack");
-                    return;
-                }
-                String loader = !parsed.loader().isBlank() ? parsed.loader() : nz(req.loader);
-                String lv = !parsed.loaderVersion().isBlank() ? parsed.loaderVersion() : nz(req.loaderVersion);
-                String name = (parsed.name() != null && !parsed.name().isBlank()) ? parsed.name() : nz(req.name);
-
-                InstanceConfig cfg = instanceManager.create(name, mc, loader, lv);
+                String name = (req.name != null && !req.name.isBlank()) ? req.name : "Modpack";
+                // La versión de MC puede venir vacía: se deduce del pack al parsearlo (async).
+                InstanceConfig cfg = instanceManager.createForModpack(
+                        name, nz(req.mcVersion), nz(req.loader), nz(req.loaderVersion));
                 cfg.sourceModpackId = nz(req.id);
+                cfg.modpackVersion = nz(req.version);
+                cfg.modpackVariant = "lite".equalsIgnoreCase(req.variant) ? "lite" : "standard";
                 instanceManager.save(cfg);
 
-                final Path pf = packFile;
-                submitInstall(cfg.id, () -> runModpackInstall(cfg, pf, parsed));
+                final String url = req.downloadUrl;
+                final String iconUrl = nz(req.icon);
+                submitInstall(cfg.id, () -> runModpackInstallFromUrl(cfg, url, iconUrl));
                 json(ctx, cfg);
             } catch (Exception e) {
                 log.error("Error preparando modpack: {}", e.getMessage(), e);
-                try { if (packFile != null) Files.deleteIfExists(packFile); } catch (Exception ignored) {}
                 ctx.status(502).result(e.getMessage());
             }
         });
@@ -870,11 +872,66 @@ public class IpcServer {
             }
         });
 
+        // Estado de actualización de una instancia de modpack (versión instalada vs catálogo).
+        app.get("/instances/{id}/modpack", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (!cfg.isModpack()) { json(ctx, Map.of("isModpack", false)); return; }
+            String latest = "";
+            try {
+                Modpack mp = findModpack(cfg.sourceModpackId);
+                if (mp != null) latest = nz(mp.version());
+            } catch (Exception e) {
+                log.debug("No se pudo consultar el catálogo para {}: {}", cfg.id, e.getMessage());
+            }
+            json(ctx, Map.of(
+                    "isModpack", true,
+                    "modpackId", nz(cfg.sourceModpackId),
+                    "variant", nz(cfg.modpackVariant),
+                    "current", nz(cfg.modpackVersion),
+                    "latest", latest,
+                    "updateAvailable", ModpackUpdater.isNewer(latest, cfg.modpackVersion)));
+        });
+
+        // Actualiza una instancia de modpack a la última versión del catálogo (diferencial, async).
+        app.post("/instances/{id}/modpack/update", ctx -> {
+            InstanceConfig cfg = instanceManager.get(ctx.pathParam("id"));
+            if (cfg == null) { ctx.status(404).result("no existe"); return; }
+            if (!cfg.isModpack()) { ctx.status(400).result("no es una instancia de modpack"); return; }
+            if (gameLauncher.isRunning(cfg.id)) {
+                ctx.status(409).result("detén la instancia antes de actualizar");
+                return;
+            }
+            Modpack mp;
+            try {
+                mp = findModpack(cfg.sourceModpackId);
+            } catch (Exception e) {
+                ctx.status(502).result("no se pudo cargar el catálogo: " + e.getMessage());
+                return;
+            }
+            if (mp == null) { ctx.status(404).result("el modpack ya no está en el catálogo"); return; }
+            if (!ModpackUpdater.isNewer(nz(mp.version()), cfg.modpackVersion)) {
+                ctx.status(409).result("la instancia ya está en la última versión");
+                return;
+            }
+            final Modpack target = mp;
+            final String url = mp.urlFor(cfg.modpackVariant);
+            submitInstall(cfg.id, () -> runModpackUpdate(cfg, target, url));
+            json(ctx, cfg);
+        });
+
         // ── Eventos ──
         app.ws("/events", ws -> {
             ws.onConnect(eventBus::register);
             ws.onClose(eventBus::unregister);
         });
+    }
+
+    /** Busca un modpack del catálogo remoto por su id; null si no está. */
+    private Modpack findModpack(String modpackId) throws Exception {
+        if (modpackId == null || modpackId.isBlank()) return null;
+        for (Modpack mp : modpacks.list()) if (modpackId.equals(mp.id())) return mp;
+        return null;
     }
 
     /** Descarga la versión y emite progreso/estado por WebSocket. */
@@ -925,6 +982,124 @@ public class IpcServer {
         }
     }
 
+    /**
+     * Descarga el archivo del modpack (con progreso por WS), deduce versión/loader del
+     * propio pack y delega en {@link #runModpackInstall}. Corre en la tarea async de
+     * instalación, de modo que el POST de /modpacks/install responde al instante.
+     */
+    private void runModpackInstallFromUrl(InstanceConfig cfg, String url, String iconUrl) {
+        Path packFile = null;
+        try {
+            eventBus.publish("state", stateEvent(cfg.id, "installing", null));
+            VanillaInstaller.Sink sink = (phase, done, total) ->
+                    eventBus.publish("progress", progressEvent(cfg.id, phase, done, total));
+
+            // El icono del catálogo pasa a ser el icono de la instancia (cuanto antes).
+            applyModpackIcon(cfg, iconUrl);
+
+            packFile = modpackInstaller.download(url, sink);
+            sink.update("Preparando modpack", 0, 1);
+            ModpackInstaller.Parsed parsed = modpackInstaller.parse(packFile);
+            sink.update("Preparando modpack", 1, 1);
+
+            String mc = !parsed.mcVersion().isBlank() ? parsed.mcVersion() : nz(cfg.mcVersion);
+            if (mc.isBlank())
+                throw new IllegalStateException("No se pudo determinar la versión de Minecraft del modpack");
+            cfg.mcVersion = mc;
+            if (!parsed.loader().isBlank()) {
+                cfg.loader = parsed.loader();
+                cfg.loaderVersion = nz(parsed.loaderVersion());
+            }
+            instanceManager.save(cfg);
+
+            final Path pf = packFile;
+            packFile = null; // la propiedad pasa a runModpackInstall (lo borra en su finally)
+            runModpackInstall(cfg, pf, parsed);
+        } catch (Throwable e) {
+            if (wasCancelled(cfg.id)) {
+                log.info("Instalación de modpack en {} cancelada.", cfg.id);
+                eventBus.publish("state", stateEvent(cfg.id, "stopped", "Instalación cancelada"));
+            } else {
+                log.error("Error instalando modpack en {}: {}", cfg.id, msg(e), e);
+                eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
+            }
+            if (packFile != null) {
+                try { Files.deleteIfExists(packFile); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Actualiza una instancia de modpack a una versión nueva del catálogo de forma
+     * diferencial: descarga el nuevo pack, calcula el diff contra el manifiesto instalado
+     * y solo aplica lo que cambió (mods nuevos/cambiados/retirados y las configs que el
+     * modpack modificó), sin tocar saves/options/logs ni archivos del usuario.
+     */
+    private void runModpackUpdate(InstanceConfig cfg, Modpack mp, String url) {
+        Path packFile = null;
+        try {
+            eventBus.publish("state", stateEvent(cfg.id, "installing", null));
+            VanillaInstaller.Sink sink = (phase, done, total) ->
+                    eventBus.publish("progress", progressEvent(cfg.id, phase, done, total));
+
+            packFile = modpackInstaller.download(url, sink);
+            sink.update("Analizando actualización", 0, 1);
+            ModpackInstaller.Parsed parsed = modpackInstaller.parse(packFile);
+            ModpackInstaller.PackContents next = modpackInstaller.scan(packFile, parsed);
+            sink.update("Analizando actualización", 1, 1);
+
+            // La versión de MC / loader puede cambiar entre versiones del modpack: si cambia,
+            // se reinstala la base (loaders.install es idempotente y baja lo que falte).
+            boolean baseChanged = false;
+            if (!parsed.mcVersion().isBlank() && !parsed.mcVersion().equals(cfg.mcVersion)) {
+                cfg.mcVersion = parsed.mcVersion();
+                baseChanged = true;
+            }
+            if (!parsed.loader().isBlank()
+                    && (!parsed.loader().equals(cfg.loader) || !nz(parsed.loaderVersion()).equals(nz(cfg.loaderVersion)))) {
+                cfg.loader = parsed.loader();
+                cfg.loaderVersion = nz(parsed.loaderVersion());
+                baseChanged = true;
+            }
+            if (baseChanged) {
+                instanceManager.save(cfg);
+                loaders.install(cfg, sink);
+            }
+
+            ModpackManifest old = ModpackManifest.load(cfg.id);
+            ModpackInstaller.Plan plan = ModpackUpdater.diff(old, next);
+            log.info("Actualización de modpack {}: {} descarga(s) · {} config(s) · {} retirado(s)",
+                    cfg.id, plan.downloads().size(), plan.extracts().size(), plan.removals().size());
+            modpackInstaller.applyPlan(packFile, LauncherPaths.instanceGameDir(cfg.id), plan, sink);
+
+            // Nuevo manifiesto + versión instalada.
+            modpackInstaller.manifestFrom(next, cfg.sourceModpackId, mp.version(),
+                    cfg.modpackVariant, parsed.format()).save(cfg.id);
+            cfg.modpackVersion = nz(mp.version());
+
+            VersionDetails v = vanilla.resolveVersion(cfg.mcVersion);
+            int major = (v.javaVersion != null) ? v.javaVersion.majorVersion : 21;
+            runtimes.resolveJavaExe(cfg, major);
+
+            cfg.installed = true;
+            instanceManager.save(cfg);
+            eventBus.publish("state", stateEvent(cfg.id, "installed", null));
+            log.info("Modpack {} actualizado a {} en instancia {}.", cfg.sourceModpackId, mp.version(), cfg.id);
+        } catch (Throwable e) {
+            if (wasCancelled(cfg.id)) {
+                log.info("Actualización de modpack en {} cancelada.", cfg.id);
+                eventBus.publish("state", stateEvent(cfg.id, "stopped", "Actualización cancelada"));
+            } else {
+                log.error("Error actualizando modpack en {}: {}", cfg.id, msg(e), e);
+                eventBus.publish("state", stateEvent(cfg.id, "error", msg(e)));
+            }
+        } finally {
+            if (packFile != null) {
+                try { Files.deleteIfExists(packFile); } catch (Exception ignored) {}
+            }
+        }
+    }
+
     /** Instala una instancia creada desde un modpack: vanilla+loader, contenido, overrides, Java. */
     private void runModpackInstall(InstanceConfig cfg, Path packFile, ModpackInstaller.Parsed parsed) {
         long t0 = System.nanoTime();
@@ -937,6 +1112,15 @@ public class IpcServer {
 
             loaders.install(cfg, sink);
             modpackInstaller.apply(packFile, parsed, LauncherPaths.instanceGameDir(cfg.id), sink);
+
+            // Manifiesto del modpack instalado (rutas + hashes): base de la actualización diferencial.
+            try {
+                ModpackInstaller.PackContents pc = modpackInstaller.scan(packFile, parsed);
+                modpackInstaller.manifestFrom(pc, cfg.sourceModpackId, cfg.modpackVersion,
+                        cfg.modpackVariant, parsed.format()).save(cfg.id);
+            } catch (Exception e) {
+                log.warn("No se pudo guardar el manifiesto del modpack {}: {}", cfg.id, e.getMessage());
+            }
 
             VersionDetails v = vanilla.resolveVersion(cfg.mcVersion);
             int major = (v.javaVersion != null) ? v.javaVersion.majorVersion : 21;
@@ -1146,6 +1330,20 @@ public class IpcServer {
         return m;
     }
 
+    /**
+     * Admin restringida (0.0.5): rechaza con 403 las acciones no permitidas en una
+     * instancia gestionada por un modpack (cambiar versión/loader, añadir/quitar/actualizar
+     * mods). Habilitar/deshabilitar y el resto de ajustes siguen permitidos. Devuelve true
+     * si bloqueó (el handler debe salir).
+     */
+    private boolean blockIfModpack(InstanceConfig cfg, io.javalin.http.Context ctx) {
+        if (cfg.isModpack()) {
+            ctx.status(403).result("Esta instancia está gestionada por un modpack; esa acción no está permitida.");
+            return true;
+        }
+        return false;
+    }
+
     private void json(io.javalin.http.Context ctx, Object body) {
         ctx.contentType("application/json; charset=utf-8")
                 .result(gson.toJson(body).getBytes(StandardCharsets.UTF_8));
@@ -1170,6 +1368,25 @@ public class IpcServer {
     private static String msg(Throwable t) {
         String m = t.getMessage();
         return (m != null && !m.isBlank()) ? m : t.getClass().getSimpleName();
+    }
+
+    /**
+     * Aplica el icono del modpack (URL del catálogo o data-URL) como icono de la instancia,
+     * salvo que ya tenga uno. El icono se normaliza a PNG 256x256 en {@link IconStore}.
+     */
+    private void applyModpackIcon(InstanceConfig cfg, String iconUrl) {
+        if (iconUrl == null || iconUrl.isBlank() || IconStore.exists(cfg.id)) return;
+        try {
+            boolean ok = iconUrl.startsWith("data:")
+                    ? IconStore.save(cfg.id, iconUrl)
+                    : IconStore.saveBytes(cfg.id, HttpConnectionPool.getInstance().getBytes(iconUrl));
+            if (ok) {
+                cfg.icon = "icon.png";
+                instanceManager.save(cfg);
+            }
+        } catch (Exception e) {
+            log.debug("No se pudo aplicar el icono del modpack a {}: {}", cfg.id, e.getMessage());
+        }
     }
 
     /** Aplica los extras de un .f24pack (icono, memoria, jvm, ventana) a la instancia creada. */
@@ -1224,7 +1441,8 @@ public class IpcServer {
     private record FileReq(String type, String fileName) {}
     private record ImportFilesReq(List<String> filePaths, String type) {}
     private record ModpackInstallReq(String id, String name, String downloadUrl,
-                                     String mcVersion, String loader, String loaderVersion) {}
+                                     String mcVersion, String loader, String loaderVersion,
+                                     String version, String variant, String icon) {}
     private record ImportReq(String filePath) {}
     private record UpdateReq(String name, Integer minMemoryMb, Integer maxMemoryMb,
                              Integer windowWidth, Integer windowHeight, Boolean fullscreen,

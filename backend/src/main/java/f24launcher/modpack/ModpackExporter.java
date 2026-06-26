@@ -107,7 +107,7 @@ public class ModpackExporter {
                 m.addProperty("jvmArgs", opt.jvmArgs != null ? opt.jvmArgs : cfg.jvmArgs);
                 if (notBlank(cfg.sourceModpackId)) m.addProperty("sourceModpackId", cfg.sourceModpackId);
                 putEntry(zip, "f24launcher.json", gson.toJson(m).getBytes(StandardCharsets.UTF_8));
-                if (hasIcon) putEntry(zip, "icon.png", Files.readAllBytes(LauncherPaths.instanceIcon(cfg.id)));
+                if (hasIcon) putFile(zip, "icon.png", LauncherPaths.instanceIcon(cfg.id));
             }
 
             // 4) overrides: contenido sin origen conocido + carpetas seleccionadas.
@@ -120,7 +120,7 @@ public class ModpackExporter {
                         if (fn.endsWith(".disabled")) continue;
                         String rel = t.folder + "/" + fn;
                         if (covered.contains(rel)) continue;
-                        putEntry(zip, "overrides/" + rel, Files.readAllBytes(p));
+                        putFile(zip, "overrides/" + rel, p);
                     }
                 }
             }
@@ -136,7 +136,7 @@ public class ModpackExporter {
                     Path p = game.resolve(rel).normalize();
                     if (!p.startsWith(game)) continue; // protección
                     if (Files.isDirectory(p)) addTree(zip, p, "overrides/" + rel);
-                    else if (Files.isRegularFile(p)) putEntry(zip, "overrides/" + rel, Files.readAllBytes(p));
+                    else if (Files.isRegularFile(p)) putFile(zip, "overrides/" + rel, p);
                 }
             }
         }
@@ -148,14 +148,22 @@ public class ModpackExporter {
         try (Stream<Path> walk = Files.walk(srcDir)) {
             for (Path p : walk.filter(Files::isRegularFile).toList()) {
                 String rel = srcDir.relativize(p).toString().replace('\\', '/');
-                putEntry(zip, prefix + "/" + rel, Files.readAllBytes(p));
+                putFile(zip, prefix + "/" + rel, p);
             }
         }
     }
 
+    /** Escribe una entrada del ZIP desde bytes en memoria (solo para los JSON pequeños). */
     private void putEntry(ZipOutputStream zip, String name, byte[] data) throws IOException {
         zip.putNextEntry(new ZipEntry(name));
         zip.write(data);
+        zip.closeEntry();
+    }
+
+    /** Escribe una entrada del ZIP copiando el archivo por streaming (memoria constante). */
+    private void putFile(ZipOutputStream zip, String name, Path src) throws IOException {
+        zip.putNextEntry(new ZipEntry(name));
+        Files.copy(src, zip);
         zip.closeEntry();
     }
 

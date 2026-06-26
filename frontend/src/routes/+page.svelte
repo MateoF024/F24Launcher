@@ -223,8 +223,12 @@
 	let addingGroup = $state(false);
 	let newGroupName = $state('');
 
-	const ungrouped = $derived(ui.instances.filter((i) => !i.group));
-	const instancesIn = (g: string) => ui.instances.filter((i) => (i.group || '') === g);
+	// Instancias de modpack: viven en su propia sección "Modpacks", separadas de las
+	// instancias manuales y de los grupos de usuario (no se arrastran a grupos).
+	const modpackInstances = $derived(ui.instances.filter((i) => i.sourceModpackId));
+	const ungrouped = $derived(ui.instances.filter((i) => !i.group && !i.sourceModpackId));
+	const instancesIn = (g: string) =>
+		ui.instances.filter((i) => (i.group || '') === g && !i.sourceModpackId);
 
 	async function loadGroups() {
 		try {
@@ -271,6 +275,7 @@
 
 	function onCardPointerDown(e: PointerEvent, inst: Instance) {
 		if (e.button !== 0) return; // solo botón principal
+		if (inst.sourceModpackId) return; // las instancias de modpack no se arrastran a grupos
 		if ((e.target as HTMLElement).closest('button')) return; // no arrancar sobre botones internos
 		dragPending = { id: inst.id, name: inst.name, icon: inst.icon, x: e.clientX, y: e.clientY };
 		window.addEventListener('pointermove', onPointerMove);
@@ -359,6 +364,17 @@
 			<p class="dim hint">Arrastra instancias aquí para quitarlas de su grupo.</p>
 		{/if}
 	</section>
+
+	{#if modpackInstances.length}
+		<section class="modpacksec" aria-label="Instancias de modpack">
+			<h2 class="secthdr">Modpacks</h2>
+			<div class="grid">
+				{#each modpackInstances as inst, i (inst.id)}
+					{@render card(inst, i)}
+				{/each}
+			</div>
+		</section>
+	{/if}
 
 	<section class="groupssec">
 		<div class="secthead">
@@ -751,6 +767,9 @@
 		background: rgba(127, 127, 127, 0.05);
 	}
 	.groupssec {
+		margin-top: 22px;
+	}
+	.modpacksec {
 		margin-top: 22px;
 	}
 	.secthead {

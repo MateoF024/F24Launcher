@@ -80,6 +80,11 @@
 		} catch {
 			/* ignore */
 		}
+		// Las instancias de modpack no admiten añadir contenido: volver a la instancia.
+		if (inst?.sourceModpackId) {
+			goto(`/instance/${id}`);
+			return;
+		}
 		await loadInstalled();
 		try {
 			gameVersions = (await listVersions()).filter((v) => v.type === 'release').map((v) => v.id);

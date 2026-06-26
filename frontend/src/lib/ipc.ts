@@ -124,6 +124,8 @@ export interface Instance {
 	lastPlayed: number;
 	totalPlayMs: number;
 	sourceModpackId: string;
+	modpackVersion: string;
+	modpackVariant: string;
 	icon: string;
 	favorite: boolean;
 	group: string;
@@ -336,7 +338,9 @@ export const getInstance = (id: string) => api<Instance>(`/instances/${id}`);
 export interface Modpack {
 	id: string;
 	name: string;
-	downloadUrl: string;
+	version: string;
+	urlStandard: string;
+	urlLite: string;
 	format: string;
 	mcVersion: string;
 	loader: string;
@@ -344,6 +348,29 @@ export interface Modpack {
 	icon: string;
 	summary: string;
 	descriptionUrl: string;
+}
+
+/** ¿El modpack ofrece variante LITE? (controla si se muestra el selector). */
+export const hasLite = (mp: Modpack) => !!mp.urlLite && mp.urlLite.trim() !== '';
+
+/** URL de descarga de una variante ("lite" → ligera; cualquier otra → estándar). */
+export const modpackUrl = (mp: Modpack, variant: 'standard' | 'lite') =>
+	variant === 'lite' && hasLite(mp) ? mp.urlLite : mp.urlStandard;
+
+/** ¿`latest` es una versión más nueva que `current`? (espejo de ModpackUpdater.isNewer). */
+export function isNewerVersion(latest: string, current: string): boolean {
+	if (!latest) return false;
+	if (!current) return true;
+	if (latest === current) return false;
+	const pa = latest.split(/[^0-9]+/).filter(Boolean).map(Number);
+	const pb = current.split(/[^0-9]+/).filter(Boolean).map(Number);
+	const n = Math.max(pa.length, pb.length);
+	for (let i = 0; i < n; i++) {
+		const x = pa[i] ?? 0;
+		const y = pb[i] ?? 0;
+		if (x !== y) return x > y;
+	}
+	return latest > current;
 }
 
 export const listModpacks = () => api<Modpack[]>('/modpacks');
@@ -366,11 +393,30 @@ export const installModpack = (body: {
 	mcVersion?: string;
 	loader?: string;
 	loaderVersion?: string;
+	version?: string;
+	variant?: 'standard' | 'lite';
+	icon?: string;
 }) => api<Instance>('/modpacks/install', { method: 'POST', body: JSON.stringify(body) });
 
 /** Importa un modpack desde un archivo local (.f24pack/.mrpack/.zip) → instancia nueva. */
 export const importModpack = (filePath: string) =>
 	api<Instance>('/modpacks/import', { method: 'POST', body: JSON.stringify({ filePath }) });
+
+export interface ModpackStatus {
+	isModpack: boolean;
+	modpackId?: string;
+	variant?: string;
+	current?: string;
+	latest?: string;
+	updateAvailable?: boolean;
+}
+
+/** Estado de actualización de una instancia de modpack (versión instalada vs catálogo). */
+export const getModpackStatus = (id: string) => api<ModpackStatus>(`/instances/${id}/modpack`);
+
+/** Actualiza una instancia de modpack a la última versión del catálogo (diferencial, async). */
+export const updateModpackInstance = (id: string) =>
+	api<Instance>(`/instances/${id}/modpack/update`, { method: 'POST' });
 
 export interface ExportOptions {
 	outputPath: string;

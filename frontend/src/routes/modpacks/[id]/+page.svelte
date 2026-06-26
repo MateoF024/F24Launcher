@@ -7,6 +7,10 @@
 		ipcReady,
 		listModpacks,
 		installModpack,
+		updateModpackInstance,
+		isNewerVersion,
+		hasLite,
+		modpackUrl,
 		getModpackReadme,
 		type Modpack
 	} from '$lib/ipc';
@@ -20,10 +24,14 @@
 	let error = $state('');
 	let bodyHtml = $state('');
 	let bodyLoading = $state(false);
+	let variant = $state<'standard' | 'lite'>('standard');
 
 	const inst = $derived(mp ? ui.instances.find((i) => i.sourceModpackId === mp!.id) : undefined);
 	const prog = $derived(inst ? ui.progress[inst.id] : undefined);
 	const status = $derived(inst ? ui.status[inst.id] : '');
+	const canUpdate = $derived(
+		!!inst && inst.installed && !!mp && isNewerVersion(mp.version, inst.modpackVersion)
+	);
 
 	onMount(async () => {
 		try {
@@ -56,16 +64,31 @@
 		return p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
 	}
 
+	async function doUpdate() {
+		if (!inst) return;
+		try {
+			await updateModpackInstance(inst.id);
+			setStatus(inst.id, 'installing');
+			setProgress(inst.id, { phase: 'Actualizando modpack', done: 0, total: 1 });
+			await refreshInstances();
+		} catch (e) {
+			error = (e as Error).message || 'No se pudo actualizar';
+		}
+	}
+
 	async function install() {
 		if (!mp) return;
 		try {
 			const created = await installModpack({
 				id: mp.id,
 				name: mp.name,
-				downloadUrl: mp.downloadUrl,
+				downloadUrl: modpackUrl(mp, variant),
 				mcVersion: mp.mcVersion,
 				loader: mp.loader,
-				loaderVersion: mp.loaderVersion
+				loaderVersion: mp.loaderVersion,
+				version: mp.version,
+				variant,
+				icon: mp.icon
 			});
 			setStatus(created.id, 'installing');
 			setProgress(created.id, { phase: 'Preparando', done: 0, total: 1 });
@@ -95,10 +118,16 @@
 			<div class="tags">
 				{#if mp.mcVersion}<span class="tag">MC {mp.mcVersion}</span>{/if}
 				{#if mp.loader}<span class="tag cap">{mp.loader}</span>{/if}
+				{#if mp.version}<span class="tag">v{mp.version}</span>{/if}
 			</div>
 		</div>
 		<div class="action">
 			{#if inst && inst.installed && !prog}
+				{#if canUpdate}
+					<button class="primary upd" onclick={doUpdate} title="Actualizar a la versión {mp.version}">
+						<Icon name="arrow-up" size={15} />Actualizar
+					</button>
+				{/if}
 				<button class="manage" onclick={() => goto(`/instance/${inst.id}`)}>
 					<Icon name="gear" size={15} />Administrar
 				</button>
@@ -112,9 +141,17 @@
 					{/if}
 				</div>
 			{:else}
-				<button class="primary" disabled={!ui.connected} onclick={install}>
-					<Icon name="download" size={15} />Instalar
-				</button>
+				<div class="installbox">
+					{#if hasLite(mp)}
+						<div class="variants" role="group" aria-label="Variante del modpack">
+							<button class:sel={variant === 'standard'} onclick={() => (variant = 'standard')}>Estándar</button>
+							<button class:sel={variant === 'lite'} onclick={() => (variant = 'lite')}>Lite</button>
+						</div>
+					{/if}
+					<button class="primary" disabled={!ui.connected} onclick={install}>
+						<Icon name="download" size={15} />Instalar
+					</button>
+				</div>
 			{/if}
 		</div>
 	</div>
@@ -196,10 +233,45 @@
 		min-width: 180px;
 		display: flex;
 		justify-content: flex-end;
+		gap: 8px;
 	}
 	.primary,
 	.manage {
 		white-space: nowrap;
+	}
+	.upd {
+		background: #3fa34d;
+		color: #fff;
+		font-weight: 700;
+		white-space: nowrap;
+	}
+	.upd:hover {
+		background: #348540;
+	}
+	.installbox {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 8px;
+	}
+	.variants {
+		display: inline-flex;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		overflow: hidden;
+	}
+	.variants button {
+		background: var(--bg-elev);
+		color: var(--text-dim);
+		border: none;
+		border-radius: 0;
+		padding: 6px 14px;
+		font-size: 12px;
+	}
+	.variants button.sel {
+		background: var(--accent);
+		color: #fff;
+		font-weight: 600;
 	}
 	.manage {
 		background: var(--bg-elev);

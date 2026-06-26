@@ -63,29 +63,6 @@ public final class ObjectStore {
     }
 
     /**
-     * Committer del {@link DownloadManager}: guarda el contenido en el store (por
-     * sha1) y deja {@code dest} como hardlink. Cae a copia atómica si no se puede enlazar.
-     */
-    public static void linkWrite(Path dest, byte[] data, String sha1) throws IOException {
-        String key = (sha1 == null || sha1.isBlank()) ? DownloadManager.bytesHash(data, "SHA-1") : sha1;
-        if (key == null || key.isBlank()) {
-            DownloadManager.writeAtomic(dest, data);
-            return;
-        }
-        Path obj = objectPath(key);
-        if (!Files.exists(obj)) {
-            DownloadManager.writeAtomic(obj, data);
-        }
-        try {
-            Files.createDirectories(dest.getParent());
-            Files.deleteIfExists(dest);
-            Files.createLink(dest, obj);
-        } catch (Exception e) {
-            DownloadManager.writeAtomic(dest, data); // otro volumen / FS sin soporte
-        }
-    }
-
-    /**
      * Committer del {@link DownloadManager} en modo streaming: el contenido ya está
      * en el temporal {@code tmp}. Si el objeto no está en el store, el temporal pasa a
      * SER el objeto (move, sin recopiar a memoria); si ya está, descarta el temporal.

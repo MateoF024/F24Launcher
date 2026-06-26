@@ -32,8 +32,10 @@ Thumbs.db
 *.swp
 *~.nib
 
-# Logs
+# Logs y volcados de memoria (datos de ejecución; nunca se publican)
 *.log
+/logs/
+*.hprof
 
 # Firma de código — la clave privada nunca se sube (el .cer público sí puede)
 tools/*.pfx

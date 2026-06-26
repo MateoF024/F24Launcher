@@ -91,6 +91,27 @@ public class InstanceManager {
         return cfg;
     }
 
+    /**
+     * Crea una instancia para un modpack cuya versión de Minecraft puede deducirse
+     * más tarde (al parsear el pack en segundo plano). A diferencia de {@link #create},
+     * tolera {@code mcVersion} vacío: la instalación async la resolverá antes de instalar.
+     */
+    public synchronized InstanceConfig createForModpack(String name, String mcVersion,
+                                                        String loader, String loaderVersion) {
+        if (name == null || name.isBlank()) name = "Instancia";
+        String mc = mcVersion == null ? "" : mcVersion.trim();
+        String id = uniqueId(slug(name));
+        InstanceConfig cfg = new InstanceConfig(id, name.trim(), mc, loader, loaderVersion);
+        applyDefaults(cfg);
+        LauncherPaths.instanceGameDir(id);
+        LauncherPaths.instanceData(id);
+        save(cfg);
+        log.info("Instancia de modpack creada: {} (MC {} · {})", id,
+                mc.isBlank() ? "por detectar" : mc,
+                cfg.loader + (cfg.loaderVersion.isEmpty() ? "" : " " + cfg.loaderVersion));
+        return cfg;
+    }
+
     /** Vuelca en la config los valores por defecto configurados en Ajustes. */
     private void applyDefaults(InstanceConfig cfg) {
         AppSettings s = AppSettings.getInstance();

@@ -472,7 +472,12 @@ fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<Child> {
         // heap vuelve a su objetivo de huella reducida. Un OOM vuelca un heap dump a
         // logs/ para poder diagnosticarlo a posteriori.
         cmd.arg("-XX:+UseG1GC")
-            .arg("-Xmx512m")
+            .arg("-Xmx768m")
+            // Con el streaming a disco la RAM por operación es constante; el techo se
+            // sube de 512→768 MB como margen para modpacks pesados (cientos de mods) y
+            // se acota explícitamente la memoria de buffers directos (antes heredaba el
+            // -Xmx y un export grande la agotaba) para que el OOM no se mueva de sitio.
+            .arg("-XX:MaxDirectMemorySize=256m")
             .arg("-XX:+HeapDumpOnOutOfMemoryError")
             .arg(format!("-XX:HeapDumpPath={}", dumps.display()))
             .arg(format!("-XX:SharedArchiveFile={}", jsa.display()))

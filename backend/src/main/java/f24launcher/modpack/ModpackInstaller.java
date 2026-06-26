@@ -17,10 +17,13 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -131,6 +134,145 @@ public class ModpackInstaller {
         }
     }
 
+    // ── Actualización diferencial (Fase 4) ────────────────────────────
+
+    /** Un override del pack: ruta destino (rel al .minecraft), su nombre en el zip, hash y tamaño. */
+    public record OverrideEntry(String path, String zipName, String sha1, long size) {}
+
+    /** Contenido completo de un pack: archivos descargables ({@code files[]}) + overrides, con hashes. */
+    public record PackContents(List<FileEntry> files, List<OverrideEntry> overrides) {}
+
+    /** Plan de actualización: qué descargar (mods), qué extraer (overrides) y qué borrar. */
+    public record Plan(List<FileEntry> downloads, List<OverrideEntry> extracts, List<String> removals) {
+        public boolean isEmpty() { return downloads.isEmpty() && extracts.isEmpty() && removals.isEmpty(); }
+        public int total() { return downloads.size() + extracts.size() + removals.size(); }
+    }
+
+    /**
+     * Escanea el pack y calcula su contenido: los {@code files[]} (ya traen ruta/url/hash)
+     * y todos los overrides, hasheados en streaming (memoria constante). Es la base para
+     * el diff de una actualización.
+     */
+    public PackContents scan(Path packFile, Parsed parsed) throws IOException {
+        List<OverrideEntry> overrides = new ArrayList<>();
+        try (ZipFile zip = new ZipFile(packFile.toFile(), StandardCharsets.UTF_8)) {
+            var entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry e = entries.nextElement();
+                if (e.isDirectory()) continue;
+                String rel = overrideRel(parsed, e.getName());
+                if (rel == null || rel.isBlank()) continue;
+                try (InputStream is = zip.getInputStream(e)) {
+                    MessageDigest md = MessageDigest.getInstance("SHA-1");
+                    byte[] buf = new byte[1 << 16];
+                    long size = 0;
+                    int n;
+                    while ((n = is.read(buf)) > 0) { md.update(buf, 0, n); size += n; }
+                    overrides.add(new OverrideEntry(rel, e.getName(), hex(md.digest()), size));
+                } catch (Exception ex) {
+                    log.warn("No se pudo hashear el override {}: {}", e.getName(), ex.getMessage());
+                }
+            }
+        }
+        return new PackContents(parsed.files(), overrides);
+    }
+
+    /** Construye el manifiesto del modpack instalado a partir de un {@link PackContents}. */
+    public ModpackManifest manifestFrom(PackContents pc, String modpackId, String version,
+                                        String variant, String format) {
+        ModpackManifest m = new ModpackManifest();
+        m.modpackId = modpackId == null ? "" : modpackId;
+        m.version = version == null ? "" : version;
+        m.variant = variant == null ? "" : variant;
+        m.format = format == null ? "" : format;
+        Set<String> seen = new HashSet<>();
+        for (FileEntry fe : pc.files()) {
+            if (fe.path() == null || fe.path().isBlank()) continue;
+            if (seen.add(fe.path()))
+                m.files.add(new ModpackManifest.Entry(fe.path(), fe.sha1(), fe.size(), ModpackManifest.Origin.DOWNLOADED));
+        }
+        for (OverrideEntry oe : pc.overrides()) {
+            if (seen.add(oe.path()))
+                m.files.add(new ModpackManifest.Entry(oe.path(), oe.sha1(), oe.size(), ModpackManifest.Origin.OVERRIDE));
+        }
+        return m;
+    }
+
+    /** Aplica un plan de actualización: descarga lo cambiado, extrae los overrides cambiados y borra lo retirado. */
+    public void applyPlan(Path packFile, Path gameDir, Plan plan, Sink sink) throws IOException {
+        // 1) Mods nuevos/cambiados (streaming a disco con dedup).
+        if (!plan.downloads().isEmpty()) {
+            List<DownloadManager.Task> tasks = new ArrayList<>();
+            for (FileEntry fe : plan.downloads()) {
+                Path dest = gameDir.resolve(fe.path()).normalize();
+                if (!dest.startsWith(gameDir)) continue; // protección zip-slip
+                tasks.add(new DownloadManager.Task(fe.url(), dest, fe.size(), fe.sha1(), fe.sha512()));
+            }
+            List<DownloadManager.Result> results =
+                    dm.downloadAll(tasks, (d, t) -> sink.update("Actualizando contenido", d, t), false, ObjectStore::linkWriteFile);
+            for (DownloadManager.Result r : results)
+                if (r.status() == DownloadManager.Status.FAILED)
+                    log.warn("No se pudo descargar {}: {}", r.task().dest().getFileName(),
+                            r.error() != null ? r.error().getMessage() : "");
+        }
+        // 2) Overrides nuevos/cambiados (extracción selectiva por streaming).
+        if (!plan.extracts().isEmpty()) {
+            try (ZipFile zip = new ZipFile(packFile.toFile(), StandardCharsets.UTF_8)) {
+                long total = plan.extracts().size();
+                long done = 0;
+                sink.update("Actualizando configuración", 0, total);
+                for (OverrideEntry oe : plan.extracts()) {
+                    ZipEntry e = zip.getEntry(oe.zipName());
+                    if (e == null) continue;
+                    Path dest = gameDir.resolve(oe.path()).normalize();
+                    if (!dest.startsWith(gameDir)) continue; // protección zip-slip
+                    Files.createDirectories(dest.getParent());
+                    try (InputStream is = zip.getInputStream(e)) {
+                        Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                    sink.update("Actualizando configuración", ++done, total);
+                }
+            }
+        }
+        // 3) Archivos del modpack retirados en la nueva versión (incluye su variante .disabled).
+        for (String rel : plan.removals()) {
+            Path dest = gameDir.resolve(rel).normalize();
+            if (!dest.startsWith(gameDir)) continue;
+            try {
+                Files.deleteIfExists(dest);
+                Files.deleteIfExists(dest.resolveSibling(dest.getFileName() + ".disabled"));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** Ruta destino (rel al .minecraft) de una entrada del zip si es un override; null si no lo es. */
+    private String overrideRel(Parsed parsed, String name) {
+        switch (parsed.format()) {
+            case "mrpack" -> {
+                String r = stripPrefix(name, "overrides/");
+                return r != null ? r : stripPrefix(name, "client-overrides/");
+            }
+            case "curseforge" -> {
+                String pfx = (parsed.overridesPrefix() == null || parsed.overridesPrefix().isBlank())
+                        ? "overrides" : parsed.overridesPrefix();
+                return stripPrefix(name, pfx.endsWith("/") ? pfx : pfx + "/");
+            }
+            default -> {
+                return isOverlay(name) ? name : null;
+            }
+        }
+    }
+
+    private static String stripPrefix(String name, String pfx) {
+        return name.startsWith(pfx) && name.length() > pfx.length() ? name.substring(pfx.length()) : null;
+    }
+
+    private static String hex(byte[] digest) {
+        StringBuilder sb = new StringBuilder(digest.length * 2);
+        for (byte b : digest) sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+        return sb.toString();
+    }
+
     // ── Parsers ───────────────────────────────────────────────────────
 
     private Parsed parseMrpack(JsonObject index) {
@@ -228,9 +370,9 @@ public class ModpackInstaller {
                 Path dest = gameDir.resolve(rel).normalize();
                 if (!dest.startsWith(gameDir)) continue; // protección zip-slip
                 Files.createDirectories(dest.getParent());
+                // Copia por streaming (sin cargar la entrada entera en memoria).
                 try (InputStream is = zip.getInputStream(e)) {
-                    Files.write(dest, is.readAllBytes(),
-                            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                    Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
                 }
                 sink.update("Extracción", ++done, total);
             }

@@ -16,7 +16,7 @@
 
 	let s = $state<AppSettingsDto | null>(null);
 	let saving = $state(false);
-	let version = $state('0.0.4');
+	let version = $state('0.0.5');
 	let needsRestart = $state(false);
 	let purging = $state(false);
 	let purgeMsg = $state('');

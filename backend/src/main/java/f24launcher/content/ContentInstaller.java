@@ -5,13 +5,16 @@ import f24launcher.core.LauncherPaths;
 import f24launcher.core.version.VanillaInstaller;
 import f24launcher.instance.InstanceConfig;
 import f24launcher.util.DownloadManager;
-import f24launcher.util.HttpConnectionPool;
 import f24launcher.util.Murmur2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.*;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -60,9 +63,15 @@ public class ContentInstaller {
         Files.createDirectories(dir);
         Path dest = dir.resolve(sanitize(version.fileName()));
         sink.update("Descargando " + version.fileName(), 0, 1);
-        byte[] data = HttpConnectionPool.getInstance().getBytes(version.downloadUrl());
-        String sha1 = hex(data, "SHA-1");
-        ObjectStore.linkWrite(dest, data, sha1); // dedup: store + hardlink (cae a copia atómica si no se puede)
+        // Descarga en streaming a disco (dedup: store + hardlink); memoria constante,
+        // nunca se carga el mod entero en el heap.
+        DownloadManager.Result r = dm.download(
+                new DownloadManager.Task(version.downloadUrl(), dest, version.size(), null, null),
+                false, ObjectStore::linkWriteFile);
+        if (r.status() == DownloadManager.Status.FAILED)
+            throw new IOException("No se pudo descargar " + version.fileName(), r.error());
+        String sha1 = DownloadManager.fileHash(dest, "SHA-1");
+        long fileSize = Files.size(dest);
 
         ProjectDetail meta = safeDetail(source, type, projectId);
         ContentManifest.Entry e = manifest.find(source, projectId, type.id);
@@ -84,9 +93,9 @@ public class ContentInstaller {
         if (e.addedAt == 0) e.addedAt = System.currentTimeMillis(); // se conserva al actualizar
         e.datePublished = version.datePublished() != null ? version.datePublished() : "";
         e.downloadUrl = version.downloadUrl();
-        e.fileSize = data.length;
+        e.fileSize = fileSize;
         e.sha1 = sha1;
-        e.sha512 = hex(data, "SHA-512");
+        e.sha512 = DownloadManager.fileHash(dest, "SHA-512");
         sink.update("Instalado " + e.name, 1, 1);
 
         // Dependencias requeridas (se tratan como mods).
@@ -173,7 +182,9 @@ public class ContentInstaller {
     public List<InstalledItem> identify(InstanceConfig cfg) {
         long t0 = System.nanoTime();
         ContentManifest manifest = ContentManifest.load(cfg.id);
-        List<Pending> pending = new ArrayList<>();
+
+        // 1) Candidatos: archivos de contenido sin entrada en el manifiesto (barato, sin leer).
+        List<Candidate> candidates = new ArrayList<>();
         for (ContentType type : ContentType.values()) {
             Path dir = folder(cfg, type);
             if (!Files.isDirectory(dir)) continue;
@@ -181,18 +192,25 @@ public class ContentInstaller {
                 for (Path p : files.filter(Files::isRegularFile).toList()) {
                     String fn = p.getFileName().toString();
                     if (!isContentFile(fn) || manifest.findByFile(fn) != null) continue;
-                    try {
-                        byte[] data = Files.readAllBytes(p);
-                        pending.add(new Pending(type, fn, hex(data, "SHA-1"),
-                                Murmur2.curseForgeFingerprint(data), data.length, fileMtime(p)));
-                    } catch (Exception ex) {
-                        log.debug("No se pudo leer {}: {}", fn, ex.getMessage());
-                    }
+                    candidates.add(new Candidate(type, p));
                 }
             } catch (Exception ignored) {}
         }
+        if (candidates.isEmpty()) return list(cfg);
+
+        // 2) Hash en paralelo (streaming: SHA-1 + fingerprint sin cargar el archivo entero).
+        List<Pending> pending = new ArrayList<>();
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<Pending>> futures = new ArrayList<>();
+            for (Candidate c : candidates) futures.add(exec.submit(() -> hashPending(c.type(), c.path())));
+            for (Future<Pending> f : futures) {
+                try { Pending pp = f.get(); if (pp != null) pending.add(pp); }
+                catch (Exception ignored) {}
+            }
+        }
         if (pending.isEmpty()) return list(cfg);
 
+        // 3) Consulta en lote a Modrinth (por SHA-1) y CurseForge (por fingerprint).
         Set<String> sha1s = new HashSet<>();
         Set<Long> fingerprints = new HashSet<>();
         for (Pending p : pending) { sha1s.add(p.sha1()); fingerprints.add(p.fingerprint()); }
@@ -201,31 +219,80 @@ public class ContentInstaller {
         log.info("identify {}: {} archivo(s) sin identificar · Modrinth {} · CurseForge {}",
                 cfg.id, pending.size(), mr.size(), cf.size());
 
-        int identified = 0;
-        for (Pending p : pending) {
-            ContentManifest.Entry e = null;
-            ContentService.ModrinthHit h = mr.get(p.sha1());
-            if (h != null) {
-                ProjectDetail d = safeDetail("modrinth", p.type(), h.projectId());
-                e = entryFrom(p.fileName(), p.type(), "modrinth", h.projectId(), h.versionId(), h.versionNumber(), d);
-                fillExport(e, h.downloadUrl(), p.sha1(), h.sha512(), p.size());
-            } else {
-                ContentService.CfMatch m = cf.get(p.fingerprint());
-                if (m != null) {
-                    ProjectDetail d = safeDetail("curseforge", p.type(), m.projectId());
-                    e = entryFrom(p.fileName(), p.type(), "curseforge", m.projectId(), m.fileId(), m.fileName(), d);
-                    fillExport(e, m.downloadUrl(), p.sha1(), "", p.size());
-                }
+        // 4) Resolver metadatos (project()) en paralelo y construir las entradas reconocidas.
+        List<ContentManifest.Entry> entries = new ArrayList<>();
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<ContentManifest.Entry>> futures = new ArrayList<>();
+            for (Pending p : pending) futures.add(exec.submit(() -> resolveEntry(p, mr, cf)));
+            for (Future<ContentManifest.Entry> f : futures) {
+                try { ContentManifest.Entry e = f.get(); if (e != null) entries.add(e); }
+                catch (Exception ignored) {}
             }
-            if (e != null) { e.addedAt = p.mtime() > 0 ? p.mtime() : System.currentTimeMillis(); manifest.items.add(e); identified++; }
         }
-        if (identified > 0) manifest.save(cfg.id);
-        log.info("identify {}: {} identificado(s) en {} ms", cfg.id, identified, (System.nanoTime() - t0) / 1_000_000);
+        for (ContentManifest.Entry e : entries) manifest.items.add(e);
+        if (!entries.isEmpty()) manifest.save(cfg.id);
+        log.info("identify {}: {} identificado(s) en {} ms", cfg.id, entries.size(), (System.nanoTime() - t0) / 1_000_000);
         return list(cfg);
     }
 
+    /** Candidato a identificar: tipo de contenido y ruta del archivo en disco. */
+    private record Candidate(ContentType type, Path path) {}
+
     /** Archivo pendiente de identificar: tipo, nombre, sha1, fingerprint CF, tamaño y mtime. */
     private record Pending(ContentType type, String fileName, String sha1, long fingerprint, long size, long mtime) {}
+
+    /**
+     * Lee un archivo en una sola pasada por bloques para el SHA-1 y la longitud
+     * normalizada, y una segunda para el fingerprint CF. Memoria constante: nunca
+     * carga el archivo entero en el heap.
+     */
+    private Pending hashPending(ContentType type, Path p) {
+        try {
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            long normLen = 0, size = 0;
+            byte[] buf = new byte[1 << 16];
+            try (InputStream in = new BufferedInputStream(Files.newInputStream(p), buf.length)) {
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    sha1.update(buf, 0, n);
+                    size += n;
+                    for (int i = 0; i < n; i++) {
+                        byte b = buf[i];
+                        if (b != 9 && b != 10 && b != 13 && b != 32) normLen++;
+                    }
+                }
+            }
+            long fp = Murmur2.curseForgeFingerprint(p, (int) normLen);
+            return new Pending(type, p.getFileName().toString(), hexOf(sha1.digest()), fp, size, fileMtime(p));
+        } catch (Exception ex) {
+            log.debug("No se pudo identificar {}: {}", p.getFileName(), ex.getMessage());
+            return null;
+        }
+    }
+
+    /** Resuelve un pendiente contra los resultados en lote (Modrinth/CF) y crea su entrada, o null. */
+    private ContentManifest.Entry resolveEntry(Pending p, Map<String, ContentService.ModrinthHit> mr,
+                                               Map<Long, ContentService.CfMatch> cf) {
+        ContentService.ModrinthHit h = mr.get(p.sha1());
+        if (h != null) {
+            ProjectDetail d = safeDetail("modrinth", p.type(), h.projectId());
+            ContentManifest.Entry e = entryFrom(p.fileName(), p.type(), "modrinth",
+                    h.projectId(), h.versionId(), h.versionNumber(), d);
+            fillExport(e, h.downloadUrl(), p.sha1(), h.sha512(), p.size());
+            e.addedAt = p.mtime() > 0 ? p.mtime() : System.currentTimeMillis();
+            return e;
+        }
+        ContentService.CfMatch m = cf.get(p.fingerprint());
+        if (m != null) {
+            ProjectDetail d = safeDetail("curseforge", p.type(), m.projectId());
+            ContentManifest.Entry e = entryFrom(p.fileName(), p.type(), "curseforge",
+                    m.projectId(), m.fileId(), m.fileName(), d);
+            fillExport(e, m.downloadUrl(), p.sha1(), "", p.size());
+            e.addedAt = p.mtime() > 0 ? p.mtime() : System.currentTimeMillis();
+            return e;
+        }
+        return null;
+    }
 
     /** Rellena los datos de reparación/export (downloadUrl + hashes + tamaño) de un mod identificado. */
     private void fillExport(ContentManifest.Entry e, String downloadUrl, String sha1, String sha512, long size) {
@@ -255,16 +322,11 @@ public class ContentInstaller {
         return e;
     }
 
-    /** Hash hexadecimal de unos bytes (p. ej. SHA-1 / SHA-512). "" si falla. */
-    public static String hex(byte[] data, String algorithm) {
-        try {
-            byte[] h = java.security.MessageDigest.getInstance(algorithm).digest(data);
-            StringBuilder sb = new StringBuilder(h.length * 2);
-            for (byte b : h) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
+    /** Representación hexadecimal de un digest ya calculado (p. ej. el de un MessageDigest). */
+    private static String hexOf(byte[] digest) {
+        StringBuilder sb = new StringBuilder(digest.length * 2);
+        for (byte b : digest) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     public Path folder(InstanceConfig cfg, ContentType type) {
